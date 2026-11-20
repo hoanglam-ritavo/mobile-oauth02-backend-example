@@ -7,9 +7,18 @@ export interface RitaConfig {
   redirectUri: string;
 }
 
+export class ConfigError extends Error {
+  readonly setting: string;
+
+  constructor(setting: string, message: string) {
+    super(message);
+    this.setting = setting;
+  }
+}
+
 function required(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
-  if (!value || value !== value.trim()) throw new Error("Configure " + key);
+  if (!value || value !== value.trim()) throw new ConfigError(key, "Configure " + key);
   return value;
 }
 
@@ -18,10 +27,10 @@ function parseUrl(value: string, key: string): URL {
   try {
     url = new URL(value);
   } catch {
-    throw new Error("Invalid " + key);
+    throw new ConfigError(key, "Invalid " + key);
   }
   if (/[\x00-\x20\x7f\\#]/.test(value) || url.username || url.password) {
-    throw new Error("Invalid " + key);
+    throw new ConfigError(key, "Invalid " + key);
   }
   return url;
 }
@@ -32,7 +41,7 @@ export function readConfig(env: NodeJS.ProcessEnv): RitaConfig & { host: string;
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(api.hostname);
   if (!/^https?:\/\//i.test(apiBaseUrl) || apiBaseUrl.includes("?") ||
       (api.protocol !== "https:" && !(api.protocol === "http:" && loopback))) {
-    throw new Error("RITA_API_BASE_URL must use HTTPS or loopback HTTP and have no query");
+    throw new ConfigError("RITA_API_BASE_URL", "RITA_API_BASE_URL must use HTTPS or loopback HTTP and have no query");
   }
 
   const redirectUri = required(env, "RITA_REDIRECT_URI");
@@ -43,17 +52,17 @@ export function readConfig(env: NodeJS.ProcessEnv): RitaConfig & { host: string;
   ];
   if (redirect.protocol === "https:" ? !/^https:\/\//i.test(redirectUri) :
       !/^[a-z][a-z0-9+.-]*:\//i.test(redirectUri) || blockedSchemes.includes(redirect.protocol)) {
-    throw new Error("RITA_REDIRECT_URI must be an HTTPS or native callback");
+    throw new ConfigError("RITA_REDIRECT_URI", "RITA_REDIRECT_URI must be an HTTPS or native callback");
   }
   if (!redirect.hostname && !redirect.pathname.startsWith("/")) {
-    throw new Error("RITA_REDIRECT_URI must have a host or path");
+    throw new ConfigError("RITA_REDIRECT_URI", "RITA_REDIRECT_URI must have a host or path");
   }
 
   const host = env.HOST ?? "127.0.0.1";
   const portValue = env.PORT ?? "3005";
   const port = Number(portValue);
-  if (host !== "localhost" && !isIP(host)) throw new Error("Invalid HOST");
-  if (!/^[0-9]+$/.test(portValue) || port < 1 || port > 65535) throw new Error("Invalid PORT");
+  if (host !== "localhost" && !isIP(host)) throw new ConfigError("HOST", "Invalid HOST");
+  if (!/^[0-9]+$/.test(portValue) || port < 1 || port > 65535) throw new ConfigError("PORT", "Invalid PORT");
 
   return {
     host, port, apiBaseUrl: api.origin + api.pathname.replace(/\/+$/, ""),

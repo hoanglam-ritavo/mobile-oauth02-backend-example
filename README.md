@@ -6,7 +6,7 @@ Backend ví dụ dành cho app đối tác D. Express và TypeScript chạy tron
 
 C nhận mã và PKCE verifier từ [D — app đối tác](../oauth02-mobile-integration-example/README.md). C giữ secret của client `confidential`, dùng `POST /auth/oauth/token` để đổi mã với A và gọi `GET /auth/oauth/userinfo` để lấy hồ sơ. C dùng `_id` của Rita để liên kết user. Phiên và UUID trả cho D do C cấp. Xem [ranh giới OAuth của A](../rita-id-backend/ARCHITECTURE.md#partner-mobile-authorization).
 
-Luồng trên thiết bị cần B có [route cấp quyền native](../rita-id-app/ARCHITECTURE.md#planned-partner-mobile-authorization). C và D dùng callback `rita-id-app://redirect`, trùng chính xác với đăng ký ở A. Cần cấu hình client, cài B và D rồi thực hiện [các ca nghiệm thu Android và iOS](../oauth02-mobile-integration-example/README.md#phase-2-acceptance-checklist).
+Luồng trên thiết bị cần bản B có [route cấp quyền native](../rita-id-app/ARCHITECTURE.md#planned-partner-mobile-authorization). C và D dùng callback `rita-partner-demo://redirect`, trùng chính xác với đăng ký ở A. Cần cấu hình client, cài B và D rồi thực hiện [các ca nghiệm thu Android và iOS](../oauth02-mobile-integration-example/README.md#phase-2-acceptance-checklist).
 
 ## Chạy thử
 
@@ -18,13 +18,15 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. `RITA_REDIRECT_URI` phải khớp chính xác callback đã đăng ký cho D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó. Kết nối từ C đến Rita dùng HTTPS, với ngoại lệ HTTP trên loopback để thử nghiệm cục bộ.
+Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó. Kết nối từ C đến Rita dùng HTTPS, với ngoại lệ HTTP trên loopback để thử nghiệm cục bộ.
 
 `RITA_CLIENT_SECRET` chỉ đặt tại C. C lắng nghe `127.0.0.1:3005` mặc định. Để thiết bị thật gọi được C, dùng địa chỉ thiết bị truy cập được và HTTPS ở đầu kết nối. `npm run build` tạo JavaScript trong `dist` và `npm start` chạy bản build.
 
 ## Hợp đồng với D
 
 Các endpoint POST nhận JSON. Thời điểm hết hạn là chuỗi ISO 8601 UTC. C trả các phản hồi với `Cache-Control: no-store`.
+
+C đọc `RITA_REDIRECT_URI` từ cấu hình và trả giá trị này dưới trường `redirectUri` của `POST /api/mobile/auth/attempts`. D so sánh với callback cố định của app trước khi mở B. Khi nhận mã qua `POST /api/mobile/auth/session`, C dùng lại giá trị từ cấu hình dưới trường `redirect_uri` để gọi `POST /auth/oauth/token` ở A. A đối chiếu giá trị này với callback đã gắn vào mã lúc phát hành.
 
 | Endpoint | Yêu cầu | Phản hồi |
 |---|---|---|
@@ -44,6 +46,20 @@ D giữ verifier trong giao dịch đang chờ, rồi mở B với `client_id`, 
 - Nếu D mất phản hồi hoàn tất, có thể gửi lại đúng dữ liệu của lần gọi cũ. C gộp các lần gọi đồng thời và có thể trả lại cùng cặp token trong 60 giây kể từ lúc cấp. Refresh hoặc logout kết thúc cửa sổ này. C chỉ giữ kết quả có token nguyên văn trong cửa sổ trả lại ngắn. Kho phiên dùng bản băm.
 - `LOGIN_RESTART_REQUIRED` và `RITA_LOGIN_RESTART_REQUIRED` yêu cầu bắt đầu đăng nhập mới. C giữ kết quả lỗi của lần đổi mã và tránh gửi lại mã sang Rita khi kết quả không xác định. Nếu D mất phản hồi refresh, D đăng nhập lại.
 - Lỗi có dạng `{ error, requestId }`. `LOGIN_PROOF_MISMATCH` trả 400, `LOGIN_ATTEMPT_CONFLICT` trả 409, `RITA_ACCOUNT_INELIGIBLE` trả 403 và `INVALID_SESSION` trả 401. `CAPACITY_EXCEEDED` trả 503 trước khi đổi mã, nên lần hoàn tất có thể gửi lại trong hạn. `USER_CAPACITY_EXCEEDED` báo kho user của tiến trình đã đầy. Giới hạn là 1.000 bản ghi cho mỗi kho và 20 lần đổi mã đồng thời.
+
+## Đọc log khi kiểm tra đăng nhập
+
+C ghi một đối tượng JSON trên mỗi dòng console. Mặc định `LOG_LEVEL=info`. Đặt `LOG_LEVEL=debug` trong `.env` của C và khởi động lại tiến trình để xem thêm cách C xử lý các yêu cầu hoàn tất lặp lại. Mỗi request có `requestId` tương ứng header `X-Request-Id`. Tìm theo `attemptId` để nối request tạo giao dịch với request hoàn tất đã qua kiểm tra state và PKCE.
+
+| Dấu hiệu | Cách đọc |
+|---|---|
+| C chưa có `startup.listening` hoặc không thấy `http.request` cho `/api/mobile/auth/attempts` sau lần thử | Xem `startup.failed`, hoặc đối chiếu địa chỉ bind và port của C với địa chỉ D đang gọi. |
+| `/attempts` trả `201` và có `startup.callback_warning` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Với cấu hình demo đúng, `startup.listening` ghi `callbackKind=partner_demo`. |
+| `/attempts` trả `201` nhưng chưa thấy `/session` | Lần gọi khởi tạo đã đến C. Xem B và D để kiểm tra mở app, consent hoặc nhận deep link quay về. |
+| `/session` gặp lỗi khi gọi Rita | Tra `rita.request` theo `requestId` hoặc `attemptId`. `operation` cho biết bước `token` hoặc `userinfo`, `outcome` cho biết lý do, còn `upstreamStatus` là mã HTTP của Rita khi có phản hồi. |
+| `auth.session_issued` xuất hiện | C đã cấp phiên. `userAction` cho biết tạo hay cập nhật user. Xem tiếp `http.request` để biết phản hồi hoàn tất hay kết nối đóng sớm. |
+
+Mã `invalid_grant` trong log cho biết Rita từ chối mã OAuth. Log ở C không xác định được lý do chi tiết phía Rita. Log chỉ ghi metadata chẩn đoán, không chứa thông tin xác thực, hồ sơ, nội dung request/response hoặc URL do client gửi.
 
 ## Kiểm thử
 

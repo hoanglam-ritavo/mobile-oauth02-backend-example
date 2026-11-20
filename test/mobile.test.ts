@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { createServer, type RequestListener } from "node:http";
+import { createServer, request as httpRequest, type RequestListener } from "node:http";
 import { test, type TestContext } from "node:test";
 import express from "express";
 import { createApp } from "../src/app.ts";
 import { readConfig } from "../src/config.ts";
 import { AuthError } from "../src/errors.ts";
+import { callbackKind, createLogger, type LogEvent, type LogLevel } from "../src/logger.ts";
 import { MobileAuth } from "../src/mobile-auth.ts";
 import { createRitaClient, type RitaClient } from "../src/rita.ts";
 
@@ -13,7 +14,7 @@ const config = readConfig({
   RITA_API_BASE_URL: "https://id.example.invalid/api/",
   RITA_CLIENT_ID: "example client",
   RITA_CLIENT_SECRET: "fictional+secret:with delimiter",
-  RITA_REDIRECT_URI: "rita-id-app://redirect",
+  RITA_REDIRECT_URI: "rita-partner-demo://redirect",
 });
 const verifier = "a".repeat(43);
 const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -184,6 +185,13 @@ async function serve(context: TestContext, handler: RequestListener) {
   return "http://127.0.0.1:" + address.port;
 }
 
+function captureLogs(level?: LogLevel) {
+  const lines: string[] = [];
+  const logger = createLogger(level, (_level, line) => lines.push(line));
+  const events = () => lines.map(line => JSON.parse(line) as LogEvent & { level: string; timestamp: string });
+  return { lines, logger, events };
+}
+
 test("C and Rita HTTP contracts complete once and manage the private session", async (context) => {
   const tokenRequests: Array<{ authorization?: string; body: unknown }> = [];
   const userInfoHeaders: Array<string | undefined> = [];
@@ -199,7 +207,8 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   });
   const ritaOrigin = await serve(context, rita);
   const { auth } = fixture(createRitaClient({ ...config, apiBaseUrl: ritaOrigin + "/api" }));
-  const cOrigin = await serve(context, createApp(auth, () => {}));
+  const logs = captureLogs("debug");
+  const cOrigin = await serve(context, createApp(auth, logs.logger));
   const request = (path: string, options?: RequestInit) => fetch(cOrigin + "/api/mobile" + path, options);
   const post = (path: string, body: unknown) => request(path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -211,6 +220,8 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   const start = await post("/auth/attempts", { codeChallenge: challenge });
   assert.equal(start.status, 201);
   assert.equal(start.headers.get("cache-control"), "no-store");
+  const startRequestId = start.headers.get("x-request-id");
+  assert.ok(startRequestId);
   const { attemptId, state, expiresAt, clientId, redirectUri, scope } = await start.json();
   assert.equal(clientId, config.clientId);
   assert.equal(redirectUri, config.redirectUri);
@@ -226,6 +237,28 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   assert.equal(duplicate.status, 200);
   const response = await finish.json();
   assert.deepEqual(await duplicate.json(), response);
+  const completedRequestIds = [finish, duplicate].map(res => res.headers.get("x-request-id"));
+  assert.equal(new Set([startRequestId, ...completedRequestIds]).size, 3);
+  const httpEvents = logs.events().filter(entry => entry.event === "http.request");
+  const creation = httpEvents.find(entry => entry.requestId === startRequestId);
+  assert.ok(creation);
+  assert.equal(creation.status, 201);
+  assert.equal(creation.attemptId, attemptId);
+  assert.equal(creation.route, "/api/mobile/auth/attempts");
+  for (const requestId of completedRequestIds) {
+    const summaries = httpEvents.filter(entry => entry.requestId === requestId);
+    assert.equal(summaries.length, 1);
+    assert.equal(summaries[0]?.attemptId, attemptId);
+    assert.equal(summaries[0]?.status, 200);
+    assert.ok((summaries[0]?.durationMs ?? -1) >= 0);
+  }
+  const ritaCalls = logs.events().filter(entry => entry.event === "rita.request");
+  assert.deepEqual(ritaCalls.map(({ operation, outcome, upstreamStatus }) =>
+    [operation, outcome, upstreamStatus]), [["token", "success", 200], ["userinfo", "success", 200]]);
+  assert.ok(ritaCalls.every(entry => entry.attemptId === attemptId && completedRequestIds.includes(entry.requestId)));
+  const issuances = logs.events().filter(entry => entry.event === "auth.session_issued");
+  assert.deepEqual(issuances.map(entry => [entry.attemptId, entry.userAction]), [[attemptId, "created"]]);
+  assert.equal(logs.events().filter(entry => entry.event === "auth.attempt_reused").length, 1);
   assert.deepEqual(tokenRequests, [{
     authorization: "Basic " + Buffer.from("example+client:fictional%2Bsecret%3Awith+delimiter").toString("base64"),
     body: {
@@ -248,4 +281,143 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   assert.equal((await post("/auth/logout", { refreshToken: session.refreshToken })).status, 204);
   assert.equal((await post("/auth/logout", { refreshToken: session.refreshToken })).status, 204);
   assert.equal((await request("/me", bearer(session.accessToken))).status, 401);
+  const output = logs.lines.join("\n");
+  for (const secret of [
+    config.clientId, config.clientSecret, tokenRequests[0]?.authorization, "example-code",
+    verifier, challenge, state, "fictional-access", "fictional-refresh",
+    response.accessToken, response.refreshToken, session.accessToken, session.refreshToken,
+    profile.id, profile.name, profile.email, response.user.id,
+  ]) {
+    assert.ok(typeof secret === "string" && !output.includes(secret), "log must omit sensitive values");
+  }
+});
+
+
+test("HTTP logs identify malformed and unknown requests without trusting headers or URLs", async (context) => {
+  const logs = captureLogs();
+  const { auth } = fixture();
+  const origin = await serve(context, createApp(auth, logs.logger));
+  const malformed = await fetch(origin + "/api/mobile/auth/attempts?secret=query-marker", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Request-Id": "external-id" },
+    body: '{"unparsed":"payload-marker"',
+  });
+  const unknown = await fetch(origin + "/unknown-path-marker");
+  const { attemptId, state } = auth.start(challenge);
+  const invalidProof = await fetch(origin + "/api/mobile/auth/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ attemptId, state, code: "example-code", codeVerifier: "b".repeat(43) }),
+  });
+  const checks = [
+    [malformed, 400, "INVALID_REQUEST", "/api/mobile/auth/attempts"],
+    [unknown, 404, "NOT_FOUND", "unmatched"],
+    [invalidProof, 400, "LOGIN_PROOF_MISMATCH", "/api/mobile/auth/session"],
+  ] as const;
+  for (const [response, status, errorCode, route] of checks) {
+    const requestId = response.headers.get("x-request-id");
+    assert.ok(requestId);
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), { error: errorCode, requestId });
+    const summaries = logs.events().filter(entry => entry.event === "http.request")
+      .filter(entry => entry.requestId === requestId);
+    assert.equal(summaries.length, 1);
+    const summary = summaries[0];
+    assert.ok(summary);
+    assert.deepEqual([summary.status, summary.errorCode, summary.route, summary.outcome, summary.level],
+      [status, errorCode, route, "completed", "warn"]);
+    assert.equal(summary.attemptId, undefined);
+  }
+  assert.doesNotMatch(logs.lines.join("\n"), /query-marker|payload-marker|unknown-path-marker|external-id/);
+});
+
+test("an interrupted request produces one early-close summary", { timeout: 3_000 }, async (context) => {
+  const { promise: exchangeStarted, resolve: markStarted } = Promise.withResolvers<void>();
+  const { promise: identity, resolve: completeExchange } = Promise.withResolvers<typeof profile>();
+  const { promise: closed, resolve: markClosed } = Promise.withResolvers<void>();
+  const { auth, start } = fixture({ identify: () => { markStarted(); return identity; } });
+  const events: LogEvent[] = [];
+  const logger = createLogger("info", (_level, line) => {
+    const entry = JSON.parse(line) as LogEvent;
+    events.push(entry);
+    if (entry.event === "http.request" && entry.outcome === "closed_early") markClosed();
+  });
+  const origin = await serve(context, createApp(auth, logger));
+  const completion = start();
+  const req = httpRequest(origin + "/api/mobile/auth/session", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+  });
+  req.on("error", () => {});
+  try {
+    req.end(JSON.stringify(completion));
+    await exchangeStarted;
+    req.destroy();
+    await closed;
+  } finally {
+    req.destroy();
+    completeExchange(profile);
+  }
+  await auth.complete(completion);
+  const summaries = events.filter(entry => entry.event === "http.request");
+  assert.equal(summaries.length, 1);
+  assert.deepEqual([summaries[0]?.outcome, summaries[0]?.attemptId, summaries[0]?.status],
+    ["closed_early", completion.attemptId, undefined]);
+});
+
+test("Rita log outcomes explain mapped errors and failed completions keep their HTTP contract", async (context) => {
+  const okToken = () => Response.json({ token_type: "Bearer", access_token: "upstream-token-marker" });
+  const cases = [
+    { operation: "token", outcome: "invalid_grant", upstream: 400, status: 401, code: "RITA_LOGIN_RESTART_REQUIRED",
+      fetch: async () => Response.json({ error: "invalid_grant", error_description: "error-body-marker" }, { status: 400 }) },
+    { operation: "token", outcome: "timeout", upstream: undefined, status: 503, code: "RITA_LOGIN_RESTART_REQUIRED",
+      fetch: async () => { throw new DOMException("timeout-marker", "TimeoutError"); } },
+    { operation: "token", outcome: "transport_error", upstream: undefined, status: 503, code: "RITA_LOGIN_RESTART_REQUIRED",
+      fetch: async () => { throw new TypeError("connection-marker"); } },
+    { operation: "token", outcome: "http_rejected", upstream: 429, status: 503, code: "RITA_LOGIN_RESTART_REQUIRED",
+      fetch: async () => new Response("rate-limit-marker", { status: 429 }) },
+    { operation: "userinfo", outcome: "invalid_response", upstream: 200, status: 502, code: "RITA_BAD_RESPONSE",
+      fetch: async (url: Parameters<typeof fetch>[0]) => String(url).endsWith("/token") ? okToken()
+        : Response.json({ name: "profile-marker" }) },
+  ];
+  for (const item of cases) {
+    await context.test(item.outcome, async (subtest) => {
+      const { auth, start } = fixture(createRitaClient(config, item.fetch));
+      const logs = captureLogs("debug");
+      const origin = await serve(subtest, createApp(auth, logs.logger));
+      const completion = start();
+      const send = () => fetch(origin + "/api/mobile/auth/session", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(completion),
+      });
+      const response = await send();
+      assert.equal(response.status, item.status);
+      const requestId = response.headers.get("x-request-id");
+      assert.deepEqual(await response.json(), { error: item.code, requestId });
+      const ritaEvents = logs.events().filter(entry => entry.event === "rita.request");
+      const failure = ritaEvents.at(-1);
+      assert.ok(failure);
+      assert.deepEqual([failure.requestId, failure.attemptId, failure.operation, failure.outcome,
+        failure.upstreamStatus, failure.errorCode],
+      [requestId, completion.attemptId, item.operation, item.outcome, item.upstream, item.code]);
+
+      const replay = await send();
+      assert.equal(replay.status, item.status);
+      assert.deepEqual(await replay.json(), { error: item.code, requestId: replay.headers.get("x-request-id") });
+      assert.equal(logs.events().filter(entry => entry.event === "rita.request").length, ritaEvents.length);
+      assert.ok(logs.events().some(entry => entry.event === "auth.attempt_reused" && entry.outcome === "cached_failure"));
+      assert.doesNotMatch(logs.lines.join("\n"), /-marker/);
+    });
+  }
+});
+
+test("info hides debug events and startup callback classification omits arbitrary URI values", () => {
+  const logs = captureLogs();
+  logs.logger("debug", { event: "auth.attempt_reused", requestId: "request", attemptId: "attempt", outcome: "replayed" });
+  const callback = callbackKind("rita-id://oauth/authorize?unexpected=callback-marker");
+  assert.equal(callback, "rita_authorize_entry");
+  logs.logger("warn", { event: "startup.callback_warning", callbackKind: callback });
+  assert.deepEqual(logs.events().map(entry => [entry.event, entry.level]), [["startup.callback_warning", "warn"]]);
+  assert.match(logs.events()[0]?.timestamp ?? "", /^\d{4}-\d\d-\d\dT/);
+  assert.doesNotMatch(logs.lines[0] ?? "", /callback-marker/);
+  assert.equal(callbackKind(config.redirectUri), "partner_demo");
+  assert.equal(callbackKind("https://example.invalid/other"), "other");
 });

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import express, { type ErrorRequestHandler, type Request } from "express";
+import { performance } from "node:perf_hooks";
+import express, { type ErrorRequestHandler, type Request, type Response } from "express";
 import { AuthError } from "./errors.ts";
+import { createLogger, durationMs, type Logger, type RequestLog } from "./logger.ts";
 import type { MobileAuth } from "./mobile-auth.ts";
 
 const randomToken = /^[A-Za-z0-9_-]{43}$/;
@@ -36,39 +38,77 @@ function accessToken(req: Request): string {
   return token;
 }
 
-export function createApp(
-  auth: MobileAuth,
-  logError = (requestId: string, code: string) => console.error({ requestId, code }),
-) {
+const routes = {
+  attempts: "/api/mobile/auth/attempts",
+  session: "/api/mobile/auth/session",
+  refresh: "/api/mobile/auth/refresh",
+  logout: "/api/mobile/auth/logout",
+  me: "/api/mobile/me",
+} as const;
+const postRoutes = new Set<string>([routes.attempts, routes.session, routes.refresh, routes.logout]);
+
+interface HttpLog extends RequestLog {
+  errorCode?: string;
+}
+
+function httpLog(res: Response): HttpLog {
+  return res.locals.httpLog as HttpLog;
+}
+
+export function createApp(auth: MobileAuth, logger: Logger = createLogger()) {
   const app = express();
   app.disable("x-powered-by");
-  app.use((_req, res, next) => {
+  app.use((req, res, next) => {
+    const startedAt = performance.now();
+    const context: HttpLog = { logger, requestId: randomUUID() };
+    const method = req.method;
+    const path = req.path.toLowerCase().replace(/\/$/, "");
+    const route = (method === "POST" && postRoutes.has(path)) ||
+      ((method === "GET" || method === "HEAD") && path === routes.me) ? path : "unmatched";
+    res.locals.httpLog = context;
     res.set("Cache-Control", "no-store");
-    res.set("X-Request-Id", randomUUID());
+    res.set("X-Request-Id", context.requestId);
+
+    const logResponse = (outcome: "completed" | "closed_early") => {
+      const status = res.headersSent ? res.statusCode : undefined;
+      const level = (status ?? 0) >= 500 || context.errorCode === "INTERNAL_ERROR"
+        ? "error"
+        : outcome === "closed_early" || (status ?? 0) >= 400 ? "warn" : "info";
+      logger(level, {
+        event: "http.request", requestId: context.requestId, attemptId: context.attemptId,
+        method, route, outcome, status, durationMs: durationMs(startedAt), errorCode: context.errorCode,
+      });
+    };
+    res.once("finish", () => logResponse("completed"));
+    res.once("close", () => {
+      if (!res.writableFinished) logResponse("closed_early");
+    });
     next();
   });
   app.use(express.json({ limit: "4kb" }));
 
-  app.post("/api/mobile/auth/attempts", (req, res) => {
+  app.post(routes.attempts, (req, res) => {
     const { codeChallenge } = payload(req, { codeChallenge: randomToken });
-    res.status(201).json(auth.start(codeChallenge));
+    const attempt = auth.start(codeChallenge);
+    httpLog(res).attemptId = attempt.attemptId;
+    res.status(201).json(attempt);
   });
-  app.post("/api/mobile/auth/session", async (req, res) => {
+  app.post(routes.session, async (req, res) => {
     const body = payload(req, {
       attemptId: uuid, state: randomToken, code: /^[\x21-\x7e]{1,512}$/, codeVerifier: verifier,
     });
     res.json(await auth.complete({
       attemptId: body.attemptId, state: body.state, code: body.code, codeVerifier: body.codeVerifier,
-    }));
+    }, httpLog(res)));
   });
-  app.post("/api/mobile/auth/refresh", (req, res) => {
+  app.post(routes.refresh, (req, res) => {
     const { refreshToken } = payload(req, { refreshToken: randomToken });
     res.json(auth.refresh(refreshToken));
   });
-  app.get("/api/mobile/me", (req, res) => {
+  app.get(routes.me, (req, res) => {
     res.json({ user: auth.me(accessToken(req)) });
   });
-  app.post("/api/mobile/auth/logout", (req, res) => {
+  app.post(routes.logout, (req, res) => {
     const { refreshToken } = payload(req, { refreshToken: randomToken });
     auth.logout(refreshToken);
     res.status(204).end();
@@ -76,9 +116,11 @@ export function createApp(
 
   app.use((_req, _res, next) => next(new AuthError(404, "NOT_FOUND")));
 
-  const onError: ErrorRequestHandler = (error, _req, res, next) => {
+  const onError: ErrorRequestHandler = (error, _req, res, _next) => {
+    const context = httpLog(res);
     if (res.headersSent) {
-      next(error);
+      context.errorCode = "INTERNAL_ERROR";
+      res.destroy();
       return;
     }
     const failure = error instanceof AuthError
@@ -88,9 +130,8 @@ export function createApp(
         : error.status >= 400 && error.status < 500
           ? invalidRequest()
           : new AuthError(500, "INTERNAL_ERROR");
-    const requestId = String(res.get("X-Request-Id"));
-    if (failure.status >= 500) logError(requestId, failure.code);
-    res.status(failure.status).json({ error: failure.code, requestId });
+    context.errorCode = failure.code;
+    res.status(failure.status).json({ error: failure.code, requestId: context.requestId });
   };
   app.use(onError);
   return app;

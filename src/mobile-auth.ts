@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { RitaConfig } from "./config.ts";
 import { AuthError } from "./errors.ts";
+import type { AttemptLog, RequestLog } from "./logger.ts";
 import type { RitaClient } from "./rita.ts";
 
 const minute = 60_000;
@@ -110,7 +111,7 @@ export class MobileAuth {
     };
   }
 
-  complete(input: Completion): Promise<SessionResponse> {
+  complete(input: Completion, log?: RequestLog): Promise<SessionResponse> {
     const attempt = this.attempts.get(input.attemptId);
     if (!attempt) throw restart();
 
@@ -124,9 +125,21 @@ export class MobileAuth {
       throw new AuthError(400, "LOGIN_PROOF_MISMATCH");
     }
 
+    let attemptLog: AttemptLog | undefined;
+    if (log) {
+      log.attemptId = input.attemptId;
+      attemptLog = { logger: log.logger, requestId: log.requestId, attemptId: input.attemptId };
+    }
+
     const codeHash = digest(input.code);
     if (status.kind !== "open") {
       if (!matches(status.codeHash, codeHash)) throw new AuthError(409, "LOGIN_ATTEMPT_CONFLICT");
+      if (attemptLog) {
+        const outcome = status.kind === "processing" ? "joined" : status.kind === "completed" ? "replayed" : "cached_failure";
+        attemptLog.logger("debug", {
+          event: "auth.attempt_reused", requestId: attemptLog.requestId, attemptId: input.attemptId, outcome,
+        });
+      }
       if (status.kind === "failed") throw status.error;
       return Promise.resolve(status.result);
     }
@@ -136,17 +149,18 @@ export class MobileAuth {
       throw capacity();
     }
     this.exchanges++;
-    const result = Promise.resolve().then(() => this.exchange(attempt, input, codeHash));
+    const result = Promise.resolve().then(() => this.exchange(attempt, input, codeHash, attemptLog));
     attempt.status = { kind: "processing", codeHash, result };
     return result;
   }
 
-  private async exchange(attempt: Attempt, input: Completion, codeHash: string) {
+  private async exchange(attempt: Attempt, input: Completion, codeHash: string, log?: AttemptLog) {
     try {
-      const identity = await this.rita.identify(input.code, input.codeVerifier);
+      const identity = await this.rita.identify(input.code, input.codeVerifier, log);
       if (this.now() >= attempt.expiresAt) throw restart();
 
       let user = this.users.get(identity.id);
+      const userAction = user ? "updated" : "created";
       if (!user) {
         if (this.users.size >= storeLimit) throw new AuthError(503, "USER_CAPACITY_EXCEEDED");
         user = { id: randomUUID(), name: identity.name, email: identity.email };
@@ -163,6 +177,9 @@ export class MobileAuth {
       };
       const result = this.issue(session, now);
       attempt.status = { kind: "completed", codeHash, result, replayUntil: now + minute };
+      log?.logger("info", {
+        event: "auth.session_issued", requestId: log.requestId, attemptId: log.attemptId, userAction,
+      });
       return result;
     } catch (error) {
       const failure = error instanceof AuthError ? error : new AuthError(503, "RITA_LOGIN_RESTART_REQUIRED");
