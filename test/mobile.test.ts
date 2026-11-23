@@ -421,3 +421,29 @@ test("info hides debug events and startup callback classification omits arbitrar
   assert.equal(callbackKind(config.redirectUri), "partner_demo");
   assert.equal(callbackKind("https://example.invalid/other"), "other");
 });
+
+test("Expo Go startup logs distinguish the callback from the authorization entry", () => {
+  const logs = captureLogs();
+  const callback = callbackKind("exp://10.0.2.2:8082/--/redirect?preview=callback-marker");
+  const authorizeEntry = callbackKind("exp://10.0.2.2:8081/--/oauth/authorize?preview=authorize-marker");
+  assert.equal(callback, "expo_go_callback");
+  assert.equal(authorizeEntry, "expo_go_authorize_entry");
+  assert.equal(callbackKind("exp://metro.example.invalid/--/redirect"), "expo_go_callback");
+  assert.equal(callbackKind("exp://metro.example.invalid/--/oauth/authorize"), "expo_go_authorize_entry");
+  assert.equal(callbackKind("exp://10.0.2.2:8082/--/redirect/"), "other");
+  assert.equal(callbackKind("exp://10.0.2.2:8081/oauth/authorize"), "other");
+  assert.equal(callbackKind("exp:///--/redirect"), "other");
+
+  const startup = { event: "startup.listening", host: "127.0.0.1", port: 3005, ritaOrigin: "https://rita.example.invalid" } as const;
+  logs.logger("info", { ...startup, callbackKind: callback });
+  logs.logger("info", { ...startup, callbackKind: authorizeEntry });
+  logs.logger("warn", { event: "startup.callback_warning", callbackKind: authorizeEntry });
+  assert.deepEqual(logs.events().map(entry => [
+    entry.event, entry.level, "callbackKind" in entry ? entry.callbackKind : undefined,
+  ]), [
+    ["startup.listening", "info", "expo_go_callback"],
+    ["startup.listening", "info", "expo_go_authorize_entry"],
+    ["startup.callback_warning", "warn", "expo_go_authorize_entry"],
+  ]);
+  assert.doesNotMatch(logs.lines.join("\n"), /exp:\/\/|preview=|-marker/);
+});

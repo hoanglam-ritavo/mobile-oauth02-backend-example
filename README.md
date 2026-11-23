@@ -54,7 +54,8 @@ C ghi một đối tượng JSON trên mỗi dòng console. Mặc định `LOG_L
 | Dấu hiệu | Cách đọc |
 |---|---|
 | C chưa có `startup.listening` hoặc không thấy `http.request` cho `/api/mobile/auth/attempts` sau lần thử | Xem `startup.failed`, hoặc đối chiếu địa chỉ bind và port của C với địa chỉ D đang gọi. |
-| `/attempts` trả `201` và có `startup.callback_warning` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Với cấu hình demo đúng, `startup.listening` ghi `callbackKind=partner_demo`. |
+| `startup.callback_warning` với `rita_authorize_entry` hoặc `expo_go_authorize_entry` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Cấu hình native của demo ghi `callbackKind=partner_demo` trong `startup.listening`. |
+| `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. D hiện yêu cầu `rita-partner-demo://redirect` và sẽ từ chối callback Expo Go trong response `/attempts`. |
 | `/attempts` trả `201` nhưng chưa thấy `/session` | Lần gọi khởi tạo đã đến C. Xem B và D để kiểm tra mở app, consent hoặc nhận deep link quay về. |
 | `/session` gặp lỗi khi gọi Rita | Tra `rita.request` theo `requestId` hoặc `attemptId`. `operation` cho biết bước `token` hoặc `userinfo`, `outcome` cho biết lý do, còn `upstreamStatus` là mã HTTP của Rita khi có phản hồi. |
 | `auth.session_issued` xuất hiện | C đã cấp phiên. `userAction` cho biết tạo hay cập nhật user. Xem tiếp `http.request` để biết phản hồi hoàn tất hay kết nối đóng sớm. |

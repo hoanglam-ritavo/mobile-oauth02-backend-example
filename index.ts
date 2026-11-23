@@ -32,7 +32,7 @@ function start() {
     logger("info", {
       event: "startup.listening", host, port, ritaOrigin: new URL(config.apiBaseUrl).origin, callbackKind: callback,
     });
-    if (callback === "rita_authorize_entry") {
+    if (callback === "rita_authorize_entry" || callback === "expo_go_authorize_entry") {
       logger("warn", { event: "startup.callback_warning", callbackKind: callback });
     }
   });

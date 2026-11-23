@@ -2,7 +2,12 @@ import { performance } from "node:perf_hooks";
 
 type Level = "debug" | "info" | "warn" | "error";
 export type LogLevel = "debug" | "info";
-export type CallbackKind = "partner_demo" | "rita_authorize_entry" | "other";
+export type CallbackKind =
+  | "partner_demo"
+  | "rita_authorize_entry"
+  | "expo_go_callback"
+  | "expo_go_authorize_entry"
+  | "other";
 export type RitaOutcome =
   | "success"
   | "timeout"
@@ -15,7 +20,7 @@ export type RitaOutcome =
 type AttemptFields = { requestId: string; attemptId: string };
 export type LogEvent =
   | { event: "startup.listening"; host: string; port: number; ritaOrigin: string; callbackKind: CallbackKind }
-  | { event: "startup.callback_warning"; callbackKind: "rita_authorize_entry" }
+  | { event: "startup.callback_warning"; callbackKind: "rita_authorize_entry" | "expo_go_authorize_entry" }
   | { event: "startup.failed"; code: string; setting?: string; host?: string; port?: number }
   | {
       event: "http.request";
@@ -77,6 +82,10 @@ export function callbackKind(uri: string): CallbackKind {
   const url = new URL(uri);
   if (url.protocol === "rita-id:" && url.host === "oauth" && url.pathname === "/authorize") {
     return "rita_authorize_entry";
+  }
+  if (url.protocol === "exp:" && url.hostname) {
+    if (url.pathname === "/--/redirect") return "expo_go_callback";
+    if (url.pathname === "/--/oauth/authorize") return "expo_go_authorize_entry";
   }
   return "other";
 }
