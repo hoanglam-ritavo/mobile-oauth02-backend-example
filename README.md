@@ -24,7 +24,7 @@ Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client *
 
 `RITA_CLIENT_SECRET` chỉ đặt tại C. C lắng nghe `127.0.0.1:3005` mặc định. Để thiết bị thật gọi được C, dùng địa chỉ thiết bị truy cập được và HTTPS ở đầu kết nối. `npm run build` tạo JavaScript trong `dist` và `npm start` chạy bản build.
 
-Với Android Expo Go development, dùng một client confidential riêng trên A development. Đặt `RITA_REDIRECT_URI` trùng với URI đã đăng ký cho client đó và `EXPO_PUBLIC_RITA_CALLBACK_URI` ở cả hai app. Ví dụ `exp://10.0.2.2:8082/--/redirect`. Xem [cấu hình Expo Go](../oauth02-mobile-integration-example/README.md#expo-go-preview).
+Với Android Expo Go development, dùng một client confidential riêng trên A development. Đặt `EXPO_PUBLIC_RITA_APP_AUTHORIZE_URL` và `EXPO_PUBLIC_RITA_CALLBACK_URI` ở D. Giá trị `RITA_REDIRECT_URI` tại C, `EXPO_PUBLIC_RITA_CALLBACK_URI` tại D và callback đăng ký cho client tại A phải khớp chính xác, chẳng hạn `exp://10.0.2.2:8082/--/redirect`. B xác định đường dẫn mở màn cấp quyền từ `hostUri` của Metro và lấy callback từ yêu cầu OAuth do D gửi. Xem [cấu hình Expo Go](../oauth02-mobile-integration-example/README.md#expo-go-preview).
 
 ## Hợp đồng với D
 
@@ -42,7 +42,9 @@ C đọc `RITA_REDIRECT_URI` từ cấu hình và trả giá trị này dưới 
 
 Ví dụ hồ sơ trong phản hồi là `{ "id": "34db4043-e171-4907-ace6-f830d4604211", "name": "Nhân viên mẫu", "email": "employee@example.invalid" }`. C liên kết theo UUID Rita `_id` từ `userinfo` và cập nhật tên/email mỗi lần đăng nhập. `id` trong phản hồi là UUID của C. Chỉ nhân viên Rita đang hoạt động được cấp phiên.
 
-D giữ verifier trong giao dịch đang chờ, rồi mở B với `client_id`, `redirect_uri`, `scope`, `state`, `response_type=code`, `code_challenge` và `code_challenge_method=S256`. Khi B trả callback, D kiểm tra `state` trước khi gọi endpoint hoàn tất. Access token của C có hạn 15 phút. Refresh token có hạn tuyệt đối 24 giờ kể từ đăng nhập. Một lần refresh thành công thay cả hai token và vô hiệu hóa cặp cũ. D lưu refresh token của C trong kho bảo mật và tuần tự hóa refresh.
+D giữ verifier trong giao dịch đang chờ, rồi mở B với `client_id`, `redirect_uri`, `scope`, `state`, `response_type=code`, `code_challenge` và `code_challenge_method=S256`. D kiểm tra URI và `state` của callback. Callback mang mã hợp lệ dẫn đến `POST /api/mobile/auth/session`. Với callback `access_denied` có `state` khớp, D xóa giao dịch đang chờ trên app và kết thúc luồng tại đó. Giao dịch đã tạo ở C hết hiệu lực 10 phút sau khi tạo và được xóa khi C chạy dọn dẹp.
+
+Access token của C có hạn 15 phút. Refresh token có hạn tuyệt đối 24 giờ kể từ đăng nhập. Một lần refresh thành công thay cả hai token và vô hiệu hóa cặp cũ. D lưu refresh token của C trong kho bảo mật và tuần tự hóa refresh.
 
 ### Thử lại và lỗi
 
@@ -59,8 +61,8 @@ C ghi một đối tượng JSON trên mỗi dòng console. Mặc định `LOG_L
 |---|---|
 | C chưa có `startup.listening` hoặc không thấy `http.request` cho `/api/mobile/auth/attempts` sau lần thử | Xem `startup.failed`, hoặc đối chiếu địa chỉ bind và port của C với địa chỉ D đang gọi. |
 | `startup.callback_warning` với `rita_authorize_entry` hoặc `expo_go_authorize_entry` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Cấu hình native của demo ghi `callbackKind=partner_demo` trong `startup.listening`. |
-| `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. Đối chiếu chính xác URL này với cấu hình B, D và đăng ký client development tại A. |
-| `/attempts` trả `201` nhưng chưa thấy `/session` | Lần gọi khởi tạo đã đến C. Xem B và D để kiểm tra mở app, consent hoặc nhận deep link quay về. |
+| `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. Đối chiếu URL này với `EXPO_PUBLIC_RITA_CALLBACK_URI` tại D và callback đăng ký cho client development tại A. |
+| `/attempts` trả `201` nhưng chưa thấy `/session` | Đây là kết quả đúng khi D đã nhận `access_denied` với `state` khớp. Nếu người dùng định đăng nhập tiếp, kiểm tra các bước mở B, xác thực callback hoặc cấp quyền tại A và nhận callback ở D. |
 | `/session` gặp lỗi khi gọi Rita | Tra `rita.request` theo `requestId` hoặc `attemptId`. `operation` cho biết bước `token` hoặc `userinfo`, `outcome` cho biết lý do, còn `upstreamStatus` là mã HTTP của Rita khi có phản hồi. |
 | `auth.session_issued` xuất hiện | C đã cấp phiên. `userAction` cho biết tạo hay cập nhật user. Xem tiếp `http.request` để biết phản hồi hoàn tất hay kết nối đóng sớm. |
 
