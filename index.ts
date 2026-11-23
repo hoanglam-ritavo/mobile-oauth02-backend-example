@@ -12,7 +12,9 @@ function start() {
   if (logLevel !== "info" && logLevel !== "debug") {
     throw new ConfigError("LOG_LEVEL", "LOG_LEVEL must be info or debug");
   }
-  const config = readConfig(process.env);
+  const config = readConfig(process.env, {
+    allowPrivateHttp: process.argv.slice(2).includes("--allow-private-rita-http"),
+  });
   const { host, port } = config;
   const callback = callbackKind(config.redirectUri);
   const auth = new MobileAuth(config, createRitaClient(config));

@@ -18,7 +18,9 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó. Kết nối từ C đến Rita dùng HTTPS, với ngoại lệ HTTP trên loopback để thử nghiệm cục bộ.
+Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
+
+`npm start` chấp nhận HTTPS và HTTP qua loopback khi C gọi Rita. `npm run dev` chấp nhận thêm HTTP tới địa chỉ IPv4 riêng trong các dải `10.0.0.0/8`, `172.16.0.0/12` và `192.168.0.0/16`, ví dụ `http://172.16.0.10:4000`. Chỉ dùng HTTP nội bộ trên mạng phát triển được kiểm soát vì C gửi OAuth client secret khi đổi mã.
 
 `RITA_CLIENT_SECRET` chỉ đặt tại C. C lắng nghe `127.0.0.1:3005` mặc định. Để thiết bị thật gọi được C, dùng địa chỉ thiết bị truy cập được và HTTPS ở đầu kết nối. `npm run build` tạo JavaScript trong `dist` và `npm start` chạy bản build.
 

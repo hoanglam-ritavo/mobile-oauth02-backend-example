@@ -35,13 +35,28 @@ function parseUrl(value: string, key: string): URL {
   return url;
 }
 
-export function readConfig(env: NodeJS.ProcessEnv): RitaConfig & { host: string; port: number } {
+function isPrivateIPv4(hostname: string): boolean {
+  if (isIP(hostname) !== 4) return false;
+  const octets = hostname.split(".");
+  const first = Number(octets[0]);
+  const second = Number(octets[1]);
+  return first === 10 ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168);
+}
+
+export function readConfig(
+  env: NodeJS.ProcessEnv,
+  { allowPrivateHttp = false }: { allowPrivateHttp?: boolean } = {},
+): RitaConfig & { host: string; port: number } {
   const apiBaseUrl = required(env, "RITA_API_BASE_URL");
   const api = parseUrl(apiBaseUrl, "RITA_API_BASE_URL");
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(api.hostname);
+  const allowsHttp = loopback || (allowPrivateHttp && isPrivateIPv4(api.hostname));
   if (!/^https?:\/\//i.test(apiBaseUrl) || apiBaseUrl.includes("?") ||
-      (api.protocol !== "https:" && !(api.protocol === "http:" && loopback))) {
-    throw new ConfigError("RITA_API_BASE_URL", "RITA_API_BASE_URL must use HTTPS or loopback HTTP and have no query");
+      (api.protocol !== "https:" && !(api.protocol === "http:" && allowsHttp))) {
+    const allowedHttp = allowPrivateHttp ? "loopback or private IPv4 HTTP" : "loopback HTTP";
+    throw new ConfigError("RITA_API_BASE_URL", `RITA_API_BASE_URL must use HTTPS or ${allowedHttp} and have no query`);
   }
 
   const redirectUri = required(env, "RITA_REDIRECT_URI");

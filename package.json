@@ -7,7 +7,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --watch index.ts",
+    "dev": "node --env-file-if-exists=.env --watch index.ts --allow-private-rita-http",
     "build": "tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "typecheck": "tsc --noEmit",

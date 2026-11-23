@@ -10,16 +10,44 @@ import { callbackKind, createLogger, type LogEvent, type LogLevel } from "../src
 import { MobileAuth } from "../src/mobile-auth.ts";
 import { createRitaClient, type RitaClient } from "../src/rita.ts";
 
-const config = readConfig({
+const configEnv = {
   RITA_API_BASE_URL: "https://id.example.invalid/api/",
   RITA_CLIENT_ID: "example client",
   RITA_CLIENT_SECRET: "fictional+secret:with delimiter",
   RITA_REDIRECT_URI: "rita-partner-demo://redirect",
-});
+};
+const config = readConfig(configEnv);
 const verifier = "a".repeat(43);
 const challenge = createHash("sha256").update(verifier).digest("base64url");
 const profile = { id: "29dc350d-1a0c-4085-919d-6d234af8dd73", name: "Nhân viên", email: "employee@example.invalid" };
 const startTime = Date.parse("2030-01-01T00:00:00Z");
+
+test("private IPv4 Rita API URLs require development opt-in for HTTP", () => {
+  for (const hostname of ["10.0.0.2", "172.16.6.209", "172.31.255.254", "192.168.1.10"]) {
+    const origin = `http://${hostname}:4000`;
+    const env = { ...configEnv, RITA_API_BASE_URL: origin + "/api/" };
+    assert.equal(readConfig(env, { allowPrivateHttp: true }).apiBaseUrl, origin + "/api");
+    assert.throws(() => readConfig(env), { setting: "RITA_API_BASE_URL" }, hostname);
+  }
+});
+
+test("development opt-in still rejects nonprivate HTTP hosts and invalid Rita API URLs", () => {
+  for (const apiBaseUrl of [
+    "http://172.15.255.254", "http://172.32.0.1", "http://192.169.0.1", "http://8.8.8.8",
+    "http://rita.local", "http://[fd00::1]", "ftp://10.0.0.2", "http://user:password@10.0.0.2",
+    "http://10.0.0.2/api?key=value", "http://10.0.0.2/api#fragment",
+  ]) {
+    const env = { ...configEnv, RITA_API_BASE_URL: apiBaseUrl };
+    assert.throws(() => readConfig(env, { allowPrivateHttp: true }), { setting: "RITA_API_BASE_URL" }, apiBaseUrl);
+  }
+});
+
+test("HTTPS and HTTP loopback Rita API URLs work by default", () => {
+  for (const origin of ["https://id.example.invalid", "http://localhost:4000", "http://127.0.0.1:4000", "http://[::1]:4000"]) {
+    const env = { ...configEnv, RITA_API_BASE_URL: origin + "/api/" };
+    assert.equal(readConfig(env).apiBaseUrl, origin + "/api");
+  }
+});
 
 function fixture(rita: RitaClient = { identify: async () => profile }) {
   let time = startTime;
