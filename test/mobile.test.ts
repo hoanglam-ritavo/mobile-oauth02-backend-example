@@ -192,7 +192,7 @@ function captureLogs(level?: LogLevel) {
   return { lines, logger, events };
 }
 
-test("C and Rita HTTP contracts complete once and manage the private session", async (context) => {
+async function verifyOAuthHttpContract(context: TestContext, callbackUri: string) {
   const tokenRequests: Array<{ authorization?: string; body: unknown }> = [];
   const userInfoHeaders: Array<string | undefined> = [];
   const rita = express();
@@ -206,7 +206,11 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
     res.json({ _id: profile.id, name: profile.name, email: profile.email, groups: "EMPLOYEE", active: true });
   });
   const ritaOrigin = await serve(context, rita);
-  const { auth } = fixture(createRitaClient({ ...config, apiBaseUrl: ritaOrigin + "/api" }));
+  const scenarioConfig = readConfig({
+    RITA_API_BASE_URL: ritaOrigin + "/api", RITA_CLIENT_ID: config.clientId, RITA_CLIENT_SECRET: config.clientSecret,
+    RITA_REDIRECT_URI: callbackUri,
+  });
+  const auth = new MobileAuth(scenarioConfig, createRitaClient(scenarioConfig), () => startTime);
   const logs = captureLogs("debug");
   const cOrigin = await serve(context, createApp(auth, logs.logger));
   const request = (path: string, options?: RequestInit) => fetch(cOrigin + "/api/mobile" + path, options);
@@ -224,7 +228,7 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   assert.ok(startRequestId);
   const { attemptId, state, expiresAt, clientId, redirectUri, scope } = await start.json();
   assert.equal(clientId, config.clientId);
-  assert.equal(redirectUri, config.redirectUri);
+  assert.equal(redirectUri, callbackUri);
   assert.equal(scope, "openid profile email");
   assert.equal(Date.parse(expiresAt), startTime + 10 * 60_000);
 
@@ -263,7 +267,7 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
     authorization: "Basic " + Buffer.from("example+client:fictional%2Bsecret%3Awith+delimiter").toString("base64"),
     body: {
       grant_type: "authorization_code", code: "example-code",
-      code_verifier: verifier, redirect_uri: config.redirectUri,
+      code_verifier: verifier, redirect_uri: callbackUri,
     },
   }]);
   assert.deepEqual(userInfoHeaders, ["Bearer fictional-access"]);
@@ -290,8 +294,12 @@ test("C and Rita HTTP contracts complete once and manage the private session", a
   ]) {
     assert.ok(typeof secret === "string" && !output.includes(secret), "log must omit sensitive values");
   }
-});
+}
 
+test("C and Rita HTTP contracts complete once and manage the private session", context =>
+  verifyOAuthHttpContract(context, config.redirectUri));
+test("C preserves an Expo Go callback through attempt creation and code exchange", context =>
+  verifyOAuthHttpContract(context, "exp://10.0.2.2:8082/--/redirect"));
 
 test("HTTP logs identify malformed and unknown requests without trusting headers or URLs", async (context) => {
   const logs = captureLogs();

@@ -22,11 +22,13 @@ Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client *
 
 `RITA_CLIENT_SECRET` chỉ đặt tại C. C lắng nghe `127.0.0.1:3005` mặc định. Để thiết bị thật gọi được C, dùng địa chỉ thiết bị truy cập được và HTTPS ở đầu kết nối. `npm run build` tạo JavaScript trong `dist` và `npm start` chạy bản build.
 
+Với Android Expo Go development, dùng một client confidential riêng trên A development. Đặt `RITA_REDIRECT_URI` trùng với URI đã đăng ký cho client đó và `EXPO_PUBLIC_RITA_CALLBACK_URI` ở cả hai app. Ví dụ `exp://10.0.2.2:8082/--/redirect`. Xem [cấu hình Expo Go](../oauth02-mobile-integration-example/README.md#expo-go-preview).
+
 ## Hợp đồng với D
 
 Các endpoint POST nhận JSON. Thời điểm hết hạn là chuỗi ISO 8601 UTC. C trả các phản hồi với `Cache-Control: no-store`.
 
-C đọc `RITA_REDIRECT_URI` từ cấu hình và trả giá trị này dưới trường `redirectUri` của `POST /api/mobile/auth/attempts`. D so sánh với callback cố định của app trước khi mở B. Khi nhận mã qua `POST /api/mobile/auth/session`, C dùng lại giá trị từ cấu hình dưới trường `redirect_uri` để gọi `POST /auth/oauth/token` ở A. A đối chiếu giá trị này với callback đã gắn vào mã lúc phát hành.
+C đọc `RITA_REDIRECT_URI` từ cấu hình và trả giá trị này dưới trường `redirectUri` của `POST /api/mobile/auth/attempts`. D so sánh với callback đã cấu hình trước khi mở B. Khi nhận mã qua `POST /api/mobile/auth/session`, C dùng lại giá trị từ cấu hình dưới trường `redirect_uri` để gọi `POST /auth/oauth/token` ở A. A đối chiếu giá trị này với callback đã gắn vào mã lúc phát hành.
 
 | Endpoint | Yêu cầu | Phản hồi |
 |---|---|---|
@@ -55,7 +57,7 @@ C ghi một đối tượng JSON trên mỗi dòng console. Mặc định `LOG_L
 |---|---|
 | C chưa có `startup.listening` hoặc không thấy `http.request` cho `/api/mobile/auth/attempts` sau lần thử | Xem `startup.failed`, hoặc đối chiếu địa chỉ bind và port của C với địa chỉ D đang gọi. |
 | `startup.callback_warning` với `rita_authorize_entry` hoặc `expo_go_authorize_entry` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Cấu hình native của demo ghi `callbackKind=partner_demo` trong `startup.listening`. |
-| `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. D hiện yêu cầu `rita-partner-demo://redirect` và sẽ từ chối callback Expo Go trong response `/attempts`. |
+| `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. Đối chiếu chính xác URL này với cấu hình B, D và đăng ký client development tại A. |
 | `/attempts` trả `201` nhưng chưa thấy `/session` | Lần gọi khởi tạo đã đến C. Xem B và D để kiểm tra mở app, consent hoặc nhận deep link quay về. |
 | `/session` gặp lỗi khi gọi Rita | Tra `rita.request` theo `requestId` hoặc `attemptId`. `operation` cho biết bước `token` hoặc `userinfo`, `outcome` cho biết lý do, còn `upstreamStatus` là mã HTTP của Rita khi có phản hồi. |
 | `auth.session_issued` xuất hiện | C đã cấp phiên. `userAction` cho biết tạo hay cập nhật user. Xem tiếp `http.request` để biết phản hồi hoàn tất hay kết nối đóng sớm. |
