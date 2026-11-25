@@ -1,4 +1,5 @@
 import { performance } from "node:perf_hooks";
+import type { ConfigIssue } from "./config.ts";
 
 type Level = "debug" | "info" | "warn" | "error";
 export type LogLevel = "debug" | "info";
@@ -21,7 +22,7 @@ type AttemptFields = { requestId: string; attemptId: string };
 export type LogEvent =
   | { event: "startup.listening"; host: string; port: number; ritaOrigin: string; callbackKind: CallbackKind }
   | { event: "startup.callback_warning"; callbackKind: "rita_authorize_entry" | "expo_go_authorize_entry" }
-  | { event: "startup.failed"; code: string; setting?: string; host?: string; port?: number }
+  | { event: "startup.failed"; code: string; setting?: string; issues?: ConfigIssue[]; hint?: string; host?: string; port?: number }
   | { event: "database.failed"; operation: "idle_connection" | "prune" | "close" }
   | {
       event: "http.request";

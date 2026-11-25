@@ -1,38 +1,44 @@
 import { createServer } from "node:http";
 import { MobileAuth } from "./src/auth/mobile-auth.ts";
-import { ConfigError, readConfig, readDatabaseUrl, readReplayKey } from "./src/config.ts";
+import { readStartupConfig, StartupConfigError } from "./src/config.ts";
 import { createAuthStore } from "./src/database/auth-store.ts";
-import { createPool } from "./src/database/pool.ts";
-import { assertSchema } from "./src/database/schema.ts";
+import { assertSchema, createDataSource } from "./src/database/data-source.ts";
 import { createApp } from "./src/http/app.ts";
 import { createRitaClient } from "./src/integrations/rita.ts";
 import { callbackKind, createLogger } from "./src/logger.ts";
 
-const logLevel = process.env.LOG_LEVEL ?? "info";
-const logger = createLogger(logLevel === "debug" ? "debug" : "info");
-
 async function start() {
-  if (logLevel !== "info" && logLevel !== "debug") {
-    throw new ConfigError("LOG_LEVEL", "LOG_LEVEL must be info or debug");
-  }
-  const config = readConfig(process.env, {
-    allowPrivateHttp: process.argv.slice(2).includes("--allow-private-rita-http"),
+  const args = process.argv.slice(2);
+  const { logLevel, replayKey, databaseUrl, synchronize, ...config } = readStartupConfig(process.env, {
+    allowPrivateHttp: args.includes("--allow-private-rita-http"),
+    synchronizeByDefault: args.includes("--synchronize-database"),
   });
+  const logger = createLogger(logLevel);
   const { host, port } = config;
   const callback = callbackKind(config.redirectUri);
-  const replayKey = readReplayKey(process.env);
-  const pool = createPool(readDatabaseUrl(process.env));
-  pool.on("error", () => logger("error", { event: "database.failed", operation: "idle_connection" }));
+  const dataSource = createDataSource(databaseUrl, {
+    synchronize,
+    onIdleError: () => logger("error", { event: "database.failed", operation: "idle_connection" }),
+  });
   try {
-    await assertSchema(pool);
+    await dataSource.initialize();
+    if (!synchronize) await assertSchema(dataSource);
   } catch {
-    logger("error", { event: "startup.failed", code: "DATABASE_NOT_READY" });
-    await pool.end();
+    logger("error", {
+      event: "startup.failed",
+      code: "DATABASE_NOT_READY",
+      hint: synchronize
+        ? "Check the PostgreSQL connection and schema synchronization permissions for C"
+        : "Check the PostgreSQL connection and permissions for C, then run npm run db:sync if the schema needs updating",
+    });
+    if (dataSource.isInitialized) await dataSource.destroy().catch(() => {
+      logger("error", { event: "database.failed", operation: "close" });
+    });
     process.exitCode = 1;
     return;
   }
 
-  const auth = new MobileAuth(config, createRitaClient(config), createAuthStore(pool), replayKey);
+  const auth = new MobileAuth(config, createRitaClient(config), createAuthStore(dataSource), replayKey);
   const server = createServer(createApp(auth, logger));
   let pruning: Promise<void> | undefined;
   const cleanup = setInterval(() => {
@@ -50,7 +56,7 @@ async function start() {
       await new Promise<void>(resolve => { server.close(() => resolve()); });
       await auth.drain();
       await pruning;
-      await pool.end();
+      await dataSource.destroy();
     } catch {
       logger("error", { event: "database.failed", operation: "close" });
       process.exitCode = 1;
@@ -82,8 +88,9 @@ async function start() {
 try {
   await start();
 } catch (error) {
-  if (error instanceof ConfigError) {
-    logger("error", { event: "startup.failed", code: "INVALID_CONFIG", setting: error.setting });
+  const logger = createLogger();
+  if (error instanceof StartupConfigError) {
+    logger("error", { event: "startup.failed", code: "INVALID_CONFIG", setting: error.issues[0].setting, issues: error.issues });
   } else {
     logger("error", { event: "startup.failed", code: "STARTUP_FAILED" });
   }

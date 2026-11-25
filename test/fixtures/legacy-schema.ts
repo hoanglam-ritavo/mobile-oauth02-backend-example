@@ -1,4 +1,7 @@
-export const initialSchema = `
+export const legacySchema = `
+  CREATE TABLE mobile_schema_migrations (version integer PRIMARY KEY);
+  INSERT INTO mobile_schema_migrations (version) VALUES (1);
+
   CREATE TABLE mobile_users (
     id uuid PRIMARY KEY,
     rita_id uuid NOT NULL UNIQUE,

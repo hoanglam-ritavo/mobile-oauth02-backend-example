@@ -1,6 +1,5 @@
-import type { Pool, PoolClient } from "pg";
+import type { DataSource, EntityManager } from "typeorm";
 import type { Attempt, AttemptStatus, AuthStore, AuthTransaction, Session, User } from "../auth/store.ts";
-import { inTransaction } from "./pool.ts";
 
 interface AttemptRow {
   id: string;
@@ -40,10 +39,10 @@ function attemptStatus(row: AttemptRow): AttemptStatus {
   }
 }
 
-function pgTransaction(client: PoolClient): AuthTransaction {
+function authTransaction(manager: EntityManager): AuthTransaction {
   return {
     async usage(now) {
-      const result = await client.query<Awaited<ReturnType<AuthTransaction["usage"]>>>(`
+      const rows = await manager.query<Awaited<ReturnType<AuthTransaction["usage"]>>[]>(`
         SELECT
           (SELECT count(*)::int FROM mobile_oauth_attempts WHERE
             CASE WHEN kind = 'completed' THEN replay_until > $1 ELSE expires_at > $1 END) AS attempts,
@@ -51,18 +50,17 @@ function pgTransaction(client: PoolClient): AuthTransaction {
           (SELECT count(*)::int FROM mobile_sessions WHERE expires_at > $1) AS sessions,
           (SELECT count(*)::int FROM mobile_users) AS users
       `, [new Date(now)]);
-      return result.rows[0]!;
+      return rows[0]!;
     },
     async attempt(id) {
-      const result = await client.query<AttemptRow>("SELECT * FROM mobile_oauth_attempts WHERE id = $1", [id]);
-      const row = result.rows[0];
+      const [row] = await manager.query<AttemptRow[]>("SELECT * FROM mobile_oauth_attempts WHERE id = $1", [id]);
       if (!row) return null;
       return { id: row.id, state: row.state, challenge: row.challenge,
         expiresAt: row.expires_at.getTime(), status: attemptStatus(row) };
     },
     async saveAttempt(attempt) {
       const { status } = attempt;
-      await client.query(`
+      await manager.query(`
         INSERT INTO mobile_oauth_attempts
           (id, state, challenge, expires_at, kind, code_hash, lease_until, replay_until, replay, error_status, error_code)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -80,34 +78,33 @@ function pgTransaction(client: PoolClient): AuthTransaction {
       ]);
     },
     async deleteAttempt(id) {
-      await client.query("DELETE FROM mobile_oauth_attempts WHERE id = $1", [id]);
+      await manager.query("DELETE FROM mobile_oauth_attempts WHERE id = $1", [id]);
     },
     async user(id) {
-      const result = await client.query<User>("SELECT id, name, email FROM mobile_users WHERE id = $1", [id]);
-      return result.rows[0] ?? null;
+      const [row] = await manager.query<User[]>("SELECT id, name, email FROM mobile_users WHERE id = $1", [id]);
+      return row ?? null;
     },
     async userByRitaId(ritaId) {
-      const result = await client.query<User>("SELECT id, name, email FROM mobile_users WHERE rita_id = $1", [ritaId]);
-      return result.rows[0] ?? null;
+      const [row] = await manager.query<User[]>("SELECT id, name, email FROM mobile_users WHERE rita_id = $1", [ritaId]);
+      return row ?? null;
     },
     async upsertUser(ritaId, user) {
-      const result = await client.query<User>(`
+      const rows = await manager.query<User[]>(`
         INSERT INTO mobile_users (id, rita_id, name, email) VALUES ($1, $2, $3, $4)
         ON CONFLICT (rita_id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email
         RETURNING id, name, email
       `, [user.id, ritaId, user.name, user.email]);
-      return result.rows[0]!;
+      return rows[0]!;
     },
     async sessionByRefresh(hash) {
-      const result = await client.query<SessionRow>("SELECT * FROM mobile_sessions WHERE refresh_hash = $1", [hash]);
-      const row = result.rows[0];
+      const [row] = await manager.query<SessionRow[]>("SELECT * FROM mobile_sessions WHERE refresh_hash = $1", [hash]);
       if (!row) return null;
       return { id: row.id, userId: row.user_id, attemptId: row.attempt_id,
         accessHash: row.access_hash, accessExpiresAt: row.access_expires_at.getTime(),
         refreshHash: row.refresh_hash, expiresAt: row.expires_at.getTime() };
     },
     async saveSession(session) {
-      await client.query(`
+      await manager.query(`
         INSERT INTO mobile_sessions (id, user_id, attempt_id, access_hash, access_expires_at, refresh_hash, expires_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (id) DO UPDATE SET access_hash = EXCLUDED.access_hash,
@@ -116,36 +113,36 @@ function pgTransaction(client: PoolClient): AuthTransaction {
         session.refreshHash, new Date(session.expiresAt)]);
     },
     async deleteSession(id) {
-      await client.query("DELETE FROM mobile_sessions WHERE id = $1", [id]);
+      await manager.query("DELETE FROM mobile_sessions WHERE id = $1", [id]);
     },
     async prune(now) {
       const cutoff = new Date(now);
-      await client.query(`DELETE FROM mobile_oauth_attempts
+      await manager.query(`DELETE FROM mobile_oauth_attempts
         WHERE (kind = 'completed' AND replay_until <= $1) OR (kind <> 'completed' AND expires_at <= $1)`, [cutoff]);
-      await client.query(`UPDATE mobile_oauth_attempts SET
+      await manager.query(`UPDATE mobile_oauth_attempts SET
         kind = 'failed', lease_until = NULL, error_status = 503, error_code = 'RITA_LOGIN_RESTART_REQUIRED'
         WHERE kind = 'processing' AND lease_until <= $1`, [cutoff]);
-      await client.query("DELETE FROM mobile_sessions WHERE expires_at <= $1", [cutoff]);
+      await manager.query("DELETE FROM mobile_sessions WHERE expires_at <= $1", [cutoff]);
     },
   };
 }
 
-export function createAuthStore(pool: Pool): AuthStore {
+export function createAuthStore(dataSource: DataSource): AuthStore {
   return {
     transaction(work) {
-      return inTransaction(pool, async client => {
+      return dataSource.transaction("READ COMMITTED", async manager => {
         // Keep quota checks and auth mutations serialized per schema. Rita calls run outside this lock.
-        await client.query("SELECT pg_advisory_xact_lock(hashtext(current_schema()), hashtext('mobile-auth'))");
-        return work(pgTransaction(client));
+        await manager.query("SELECT pg_advisory_xact_lock(hashtext(current_schema()), hashtext('mobile-auth'))");
+        return work(authTransaction(manager));
       });
     },
     async userByAccess(hash, now) {
-      const result = await pool.query<User>(`
+      const [row] = await dataSource.query<User[]>(`
         SELECT u.id, u.name, u.email
         FROM mobile_sessions s JOIN mobile_users u ON u.id = s.user_id
         WHERE s.access_hash = $1 AND s.access_expires_at > $2 AND s.expires_at > $2
       `, [hash, new Date(now)]);
-      return result.rows[0] ?? null;
+      return row ?? null;
     },
   };
 }

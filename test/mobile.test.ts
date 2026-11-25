@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, request as httpRequest, type RequestListener } from "node:http";
 import { test, type TestContext } from "node:test";
 import express from "express";
 import { Client } from "pg";
 import { MobileAuth } from "../src/auth/mobile-auth.ts";
-import { readConfig, readDatabaseUrl, readReplayKey } from "../src/config.ts";
+import { readConfig, readDatabaseUrl, readReplayKey, readStartupConfig } from "../src/config.ts";
 import { AuthError } from "../src/errors.ts";
 import { createApp } from "../src/http/app.ts";
 import { createRitaClient, type RitaClient } from "../src/integrations/rita.ts";
@@ -35,6 +36,66 @@ test("database URL and canonical replay key are required by the persistence conf
   assert.throws(() => readReplayKey({}), { setting: "OAUTH_REPLAY_KEY" });
   assert.throws(() => readReplayKey({ OAUTH_REPLAY_KEY: replayKey.toString("base64") }), { setting: "OAUTH_REPLAY_KEY" });
   assert.deepEqual(readReplayKey({ OAUTH_REPLAY_KEY: replayKey.toString("base64url") }), replayKey);
+});
+
+test("startup reports every invalid setting in one log without exposing input values", async context => {
+  const cases = [
+    {
+      name: "missing persistence settings",
+      env: configEnv,
+      settings: ["OAUTH_REPLAY_KEY", "DATABASE_URL"],
+      inputValues: [],
+    },
+    {
+      name: "malformed settings",
+      env: {
+        LOG_LEVEL: "bad-log-level-marker",
+        RITA_API_BASE_URL: "https://marker:rita-url-password@example.invalid/api",
+        RITA_REDIRECT_URI: "http://redirect-marker.example.invalid",
+        HOST: "host-marker.example.invalid",
+        PORT: "port-marker",
+        RITA_CLIENT_ID: " client-id-marker ",
+        RITA_CLIENT_SECRET: " client-secret-marker ",
+        OAUTH_REPLAY_KEY: "replay-key-marker",
+        DATABASE_URL: "https://marker:database-password@example.invalid/partner",
+        DATABASE_SYNCHRONIZE: "database-synchronize-marker",
+      },
+      settings: ["LOG_LEVEL", "RITA_API_BASE_URL", "RITA_REDIRECT_URI", "HOST", "PORT", "RITA_CLIENT_ID",
+        "RITA_CLIENT_SECRET", "OAUTH_REPLAY_KEY", "DATABASE_URL", "DATABASE_SYNCHRONIZE"],
+      inputValues: ["bad-log-level-marker", "rita-url-password", "redirect-marker", "host-marker", "port-marker",
+        "client-id-marker", "client-secret-marker", "replay-key-marker", "database-password", "database-synchronize-marker"],
+    },
+  ];
+
+  for (const { name, env, settings, inputValues } of cases) {
+    await context.test(name, () => {
+      const child = spawnSync(process.execPath, ["index.ts", "--allow-private-rita-http"], {
+        cwd: new URL("../", import.meta.url), env, encoding: "utf8", timeout: 5_000,
+      });
+      assert.ifError(child.error);
+      assert.equal(child.status, 1);
+      assert.equal(child.stdout.trim(), "");
+      for (const value of inputValues) assert.ok(!child.stderr.includes(value), "Log exposed a configuration value");
+      const event = JSON.parse(child.stderr.trim());
+      assert.equal(event.event, "startup.failed");
+      assert.equal(event.code, "INVALID_CONFIG");
+      assert.equal(event.setting, settings[0]);
+      assert.deepEqual(event.issues.map((issue: { setting: string }) => issue.setting), settings);
+      for (const issue of event.issues) assert.ok(issue.hint?.length > 0);
+    });
+  }
+});
+
+test("explicit database synchronization overrides the command default", () => {
+  const env = {
+    ...configEnv,
+    OAUTH_REPLAY_KEY: replayKey.toString("base64url"),
+    DATABASE_URL: "postgresql://fixture-user:fixture-password@localhost/partner",
+  };
+  assert.equal(readStartupConfig(env).synchronize, false);
+  assert.equal(readStartupConfig(env, { synchronizeByDefault: true }).synchronize, true);
+  assert.equal(readStartupConfig({ ...env, DATABASE_SYNCHRONIZE: "true" }).synchronize, true);
+  assert.equal(readStartupConfig({ ...env, DATABASE_SYNCHRONIZE: "false" }, { synchronizeByDefault: true }).synchronize, false);
 });
 
 test("database URL preserves a password containing @ for pg", () => {

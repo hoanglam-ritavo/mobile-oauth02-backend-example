@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { test, type TestContext } from "node:test";
-import type { Pool } from "pg";
+import type { DataSource } from "typeorm";
 import { MobileAuth } from "../src/auth/mobile-auth.ts";
 import type { SessionResponse } from "../src/auth/store.ts";
 import { createAuthStore } from "../src/database/auth-store.ts";
-import { createPool } from "../src/database/pool.ts";
-import { assertSchema, migrateSchema } from "../src/database/schema.ts";
+import { assertSchema, createDataSource } from "../src/database/data-source.ts";
 import { createApp } from "../src/http/app.ts";
 import type { RitaClient } from "../src/integrations/rita.ts";
+import { legacySchema } from "./fixtures/legacy-schema.ts";
 
 const databaseUrl = process.env.C_TEST_DATABASE_URL;
 const replayKey = Buffer.alloc(32, 9);
@@ -25,31 +25,32 @@ function testPostgres(name: string, work: (context: TestContext, url: string) =>
 
 async function database(context: TestContext, url: string) {
   const schema = "partner_test_" + randomUUID().replaceAll("-", "");
-  const admin = createPool(url);
-  const pools = new Set<Pool>();
+  const admin = await createDataSource(url).initialize();
+  const dataSources = new Set<DataSource>();
   context.after(async () => {
     try {
-      await Promise.all([...pools].map(pool => pool.end()));
+      await Promise.all([...dataSources].map(dataSource => dataSource.destroy()));
       await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     } finally {
-      await admin.end();
+      await admin.destroy();
     }
   });
   await admin.query(`CREATE SCHEMA "${schema}"`);
   return {
-    open() {
-      const pool = createPool(url, "-c search_path=" + schema);
-      pools.add(pool);
-      return pool;
+    async open(synchronize = false) {
+      const dataSource = await createDataSource(url, { schema, synchronize }).initialize();
+      dataSources.add(dataSource);
+      return dataSource;
     },
-    async close(pool: Pool) {
-      if (pools.delete(pool)) await pool.end();
+    async close(dataSource: DataSource) {
+      await dataSource.destroy();
+      dataSources.delete(dataSource);
     },
   };
 }
 
-function authService(pool: Pool, rita: RitaClient, now = Date.now, key = replayKey) {
-  return new MobileAuth(config, rita, createAuthStore(pool), key, now);
+function authService(dataSource: DataSource, rita: RitaClient, now = Date.now, key = replayKey) {
+  return new MobileAuth(config, rita, createAuthStore(dataSource), key, now);
 }
 
 async function listen(context: TestContext, auth: MobileAuth) {
@@ -82,12 +83,54 @@ function completion(attempt: { attemptId: string; state: string }, code = "ficti
   return { attemptId: attempt.attemptId, state: attempt.state, code, codeVerifier: verifier };
 }
 
-testPostgres("schema migration is repeatable and HTTP retries, refresh and identity survive C restart", async (context, url) => {
+async function constraintsAndIndexes(dataSource: DataSource) {
+  return dataSource.query<{ name: string; definition: string }[]>(`
+    WITH tables AS (
+      SELECT oid FROM pg_class WHERE relnamespace = current_schema()::regnamespace
+        AND relname IN ('mobile_users', 'mobile_oauth_attempts', 'mobile_sessions')
+    )
+    SELECT conname AS name, pg_get_constraintdef(oid) AS definition
+      FROM pg_constraint WHERE conrelid IN (SELECT oid FROM tables)
+    UNION ALL
+    SELECT relname AS name, replace(pg_get_indexdef(indexrelid), current_schema() || '.', '') AS definition
+      FROM pg_index JOIN pg_class ON oid = indexrelid WHERE indrelid IN (SELECT oid FROM tables)
+    ORDER BY name, definition
+  `);
+}
+
+testPostgres("schema synchronization matches the legacy constraints and adopts existing data", async (context, url) => {
+  const legacyDb = await database(context, url);
+  const legacy = await legacyDb.open();
+  await legacy.query(legacySchema);
+  await assertSchema(legacy);
+  const expected = await constraintsAndIndexes(legacy);
+  assert.ok(expected.some(index => index.name === "mobile_oauth_attempts_replay_idx" &&
+    index.definition.includes("WHERE (kind = 'completed'::text)")));
+
+  const freshDb = await database(context, url);
+  const fresh = await freshDb.open(true);
+  await assertSchema(fresh);
+  assert.deepEqual(await constraintsAndIndexes(fresh), expected);
+
+  const original = authService(legacy, { identify: async () => profile });
+  const input = completion(await original.start(challenge));
+  const issued = await original.complete(input);
+  await legacyDb.close(legacy);
+
+  const adopted = await legacyDb.open(true);
+  await assertSchema(adopted);
+  assert.deepEqual(await constraintsAndIndexes(adopted), expected);
+  const restarted = authService(adopted, { identify: async () => assert.fail("The adopted attempt must replay") });
+  assert.deepEqual(await restarted.me(issued.accessToken), issued.user);
+  assert.deepEqual(await restarted.complete(input), issued);
+});
+
+testPostgres("schema synchronization is repeatable and HTTP retries, refresh and identity survive C restart", async (context, url) => {
   const db = await database(context, url);
-  const first = db.open();
-  await assert.rejects(assertSchema(first));
-  await migrateSchema(first);
-  await migrateSchema(first);
+  const unsynchronized = await db.open();
+  await assert.rejects(assertSchema(unsynchronized), /Database schema is not ready/);
+  await db.close(unsynchronized);
+  const first = await db.open(true);
   await assertSchema(first);
   let profileAtRita = profile;
   let exchanges = 0;
@@ -99,22 +142,23 @@ testPostgres("schema migration is repeatable and HTTP retries, refresh and ident
   await initial.stop();
   await db.close(first);
 
-  const middle = db.open();
+  const middle = await db.open(true);
+  await assertSchema(middle);
   const afterAttempt = await listen(context, authService(middle, rita));
   const input = completion(attempt);
   const issued = await response<SessionResponse>(await afterAttempt.post("/auth/session", input), 200);
   await afterAttempt.stop();
   await db.close(middle);
 
-  const last = db.open();
+  const last = await db.open();
   const afterIssuance = await listen(context, authService(last, rita));
   assert.deepEqual(await response(await afterIssuance.me(issued.accessToken), 200), { user: issued.user });
   assert.deepEqual(await response(await afterIssuance.post("/auth/session", input), 200), issued);
   assert.equal(exchanges, 1);
-  const stored = await last.query<{ replay: string; access_hash: string; refresh_hash: string }>(`
+  const [row] = await last.query<{ replay: string; access_hash: string; refresh_hash: string }[]>(`
     SELECT a.replay, s.access_hash, s.refresh_hash FROM mobile_oauth_attempts a JOIN mobile_sessions s ON s.attempt_id = a.id
   `);
-  const row = stored.rows[0]!;
+  assert.ok(row);
   assert.match(row.replay, /^v1\./);
   assert.equal(row.replay.includes(issued.refreshToken) || row.replay.includes(issued.accessToken), false);
   assert.equal(row.access_hash, createHash("sha256").update(issued.accessToken).digest("base64url"));
@@ -145,9 +189,8 @@ testPostgres("schema migration is repeatable and HTTP retries, refresh and ident
 
 testPostgres("parallel DB clients share one completion and only one refresh can rotate", async (context, url) => {
   const db = await database(context, url);
-  const first = db.open();
-  const second = db.open();
-  await migrateSchema(first);
+  const first = await db.open(true);
+  const second = await db.open();
   const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
   const { promise: identification, resolve } = Promise.withResolvers<typeof profile>();
   let calls = 0;
@@ -167,7 +210,7 @@ testPostgres("parallel DB clients share one completion and only one refresh can 
   const [left, right] = await Promise.all([claim, joined]);
   assert.deepEqual(left, right);
   assert.equal(calls, 1);
-  assert.equal((await first.query("SELECT id FROM mobile_sessions")).rowCount, 1);
+  assert.equal((await first.query("SELECT id FROM mobile_sessions")).length, 1);
   const rotations = await Promise.allSettled([a.refresh(left.refreshToken), b.refresh(left.refreshToken)]);
   assert.equal(rotations.filter(result => result.status === "fulfilled").length, 1);
   const rejected = rotations.find(result => result.status === "rejected");
@@ -178,12 +221,11 @@ testPostgres("parallel DB clients share one completion and only one refresh can 
 
 testPostgres("a duplicate still waiting gets Retry-After and can replay after the claim completes", async (context, url) => {
   const db = await database(context, url);
-  const pool = db.open();
-  await migrateSchema(pool);
+  const dataSource = await db.open(true);
   const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
   const { promise: identification, resolve } = Promise.withResolvers<typeof profile>();
   let calls = 0;
-  const auth = authService(pool, { identify: () => { calls++; markStarted(); return identification; } });
+  const auth = authService(dataSource, { identify: () => { calls++; markStarted(); return identification; } });
   const app = await listen(context, auth);
   const attempt = await response<{ attemptId: string; state: string }>(
     await app.post("/auth/attempts", { codeChallenge: challenge }), 201);
@@ -204,9 +246,8 @@ testPostgres("a duplicate still waiting gets Retry-After and can replay after th
 
 testPostgres("a failed commit rolls back user and session and prevents a second Rita exchange", async (context, url) => {
   const db = await database(context, url);
-  const pool = db.open();
-  await migrateSchema(pool);
-  await pool.query(`
+  const dataSource = await db.open(true);
+  await dataSource.query(`
     CREATE FUNCTION fail_completion() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       IF NEW.kind = 'completed' THEN RAISE EXCEPTION 'fictional completion failure'; END IF;
@@ -216,20 +257,19 @@ testPostgres("a failed commit rolls back user and session and prevents a second 
       FOR EACH ROW EXECUTE FUNCTION fail_completion();
   `);
   let calls = 0;
-  const auth = authService(pool, { identify: async () => { calls++; return profile; } });
+  const auth = authService(dataSource, { identify: async () => { calls++; return profile; } });
   const input = completion(await auth.start(challenge));
   await assert.rejects(auth.complete(input), /RITA_LOGIN_RESTART_REQUIRED/);
-  assert.equal((await pool.query("SELECT id FROM mobile_users")).rowCount, 0);
-  assert.equal((await pool.query("SELECT id FROM mobile_sessions")).rowCount, 0);
+  assert.equal((await dataSource.query("SELECT id FROM mobile_users")).length, 0);
+  assert.equal((await dataSource.query("SELECT id FROM mobile_sessions")).length, 0);
   await assert.rejects(auth.complete(input), /RITA_LOGIN_RESTART_REQUIRED/);
   assert.equal(calls, 1);
 });
 
 testPostgres("expired claims require restart and the old attempt cannot issue a session", async (context, url) => {
   const db = await database(context, url);
-  const first = db.open();
-  const second = db.open();
-  await migrateSchema(first);
+  const first = await db.open(true);
+  const second = await db.open();
   let time = Date.parse("2030-01-01T00:00:00Z");
   const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
   const { promise: identification, resolve } = Promise.withResolvers<typeof profile>();
@@ -247,15 +287,14 @@ testPostgres("expired claims require restart and the old attempt cannot issue a 
     resolve(profile);
   }
   await rejected;
-  assert.equal((await second.query("SELECT id FROM mobile_sessions")).rowCount, 0);
+  assert.equal((await second.query("SELECT id FROM mobile_sessions")).length, 0);
 });
 
 testPostgres("cleanup expires replay and sessions independently of user mappings", async (context, url) => {
   const db = await database(context, url);
-  const pool = db.open();
-  await migrateSchema(pool);
+  const dataSource = await db.open(true);
   let time = Date.parse("2030-01-01T00:00:00Z");
-  const auth = authService(pool, { identify: async () => profile }, () => time);
+  const auth = authService(dataSource, { identify: async () => profile }, () => time);
   const input = completion(await auth.start(challenge));
   const issued = await auth.complete(input);
   const unused = completion(await auth.start(challenge));
@@ -269,7 +308,7 @@ testPostgres("cleanup expires replay and sessions independently of user mappings
   time += 24 * 60 * 60_000;
   await auth.prune();
   await assert.rejects(auth.refresh(issued.refreshToken), /INVALID_SESSION/);
-  assert.equal((await pool.query("SELECT id FROM mobile_sessions")).rowCount, 0);
-  assert.equal((await pool.query("SELECT id FROM mobile_oauth_attempts")).rowCount, 0);
-  assert.equal((await pool.query("SELECT id FROM mobile_users")).rowCount, 1);
+  assert.equal((await dataSource.query("SELECT id FROM mobile_sessions")).length, 0);
+  assert.equal((await dataSource.query("SELECT id FROM mobile_oauth_attempts")).length, 0);
+  assert.equal((await dataSource.query("SELECT id FROM mobile_users")).length, 1);
 });

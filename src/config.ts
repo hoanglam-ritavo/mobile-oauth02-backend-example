@@ -16,41 +16,52 @@ export class ConfigError extends Error {
   }
 }
 
-function required(env: NodeJS.ProcessEnv, key: string): string {
+export interface ConfigIssue {
+  setting: string;
+  hint: string;
+}
+
+export class StartupConfigError extends Error {
+  readonly issues: [ConfigIssue, ...ConfigIssue[]];
+
+  constructor(issues: [ConfigIssue, ...ConfigIssue[]]) {
+    super("Invalid startup configuration");
+    this.issues = issues;
+  }
+}
+
+function required(env: NodeJS.ProcessEnv, key: string, hint: string): string {
   const value = env[key];
-  if (!value || value !== value.trim()) throw new ConfigError(key, "Configure " + key);
+  if (!value || value !== value.trim()) throw new ConfigError(key, hint);
   return value;
 }
 
 export function readDatabaseUrl(env: NodeJS.ProcessEnv): string {
-  const value = required(env, "DATABASE_URL");
+  const hint = "Set a PostgreSQL URL with a user and database dedicated to C";
+  const value = required(env, "DATABASE_URL", hint);
   const url = URL.parse(value);
   if (!url || !["postgresql:", "postgres:"].includes(url.protocol) ||
       !url.hostname || !url.username || url.pathname.length <= 1 ||
       /[\x00-\x20\x7f\\#]/.test(value)) {
-    throw new ConfigError("DATABASE_URL", "Configure a PostgreSQL URL with a database and user");
+    throw new ConfigError("DATABASE_URL", hint);
   }
   return value;
 }
 
 export function readReplayKey(env: NodeJS.ProcessEnv): Buffer {
-  const value = required(env, "OAUTH_REPLAY_KEY");
+  const hint = "Set a persistent 32-byte key encoded as base64url without padding";
+  const value = required(env, "OAUTH_REPLAY_KEY", hint);
   const key = Buffer.from(value, "base64url");
   if (key.length !== 32 || key.toString("base64url") !== value) {
-    throw new ConfigError("OAUTH_REPLAY_KEY", "Configure a 32-byte base64url key");
+    throw new ConfigError("OAUTH_REPLAY_KEY", hint);
   }
   return key;
 }
 
-function parseUrl(value: string, key: string): URL {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ConfigError(key, "Invalid " + key);
-  }
-  if (/[\x00-\x20\x7f\\#]/.test(value) || url.username || url.password) {
-    throw new ConfigError(key, "Invalid " + key);
+function parseUrl(value: string, key: string, hint: string): URL {
+  const url = URL.parse(value);
+  if (!url || /[\x00-\x20\x7f\\#]/.test(value) || url.username || url.password) {
+    throw new ConfigError(key, hint);
   }
   return url;
 }
@@ -65,44 +76,114 @@ function isPrivateIPv4(hostname: string): boolean {
     (first === 192 && second === 168);
 }
 
-export function readConfig(
-  env: NodeJS.ProcessEnv,
-  { allowPrivateHttp = false }: { allowPrivateHttp?: boolean } = {},
-): RitaConfig & { host: string; port: number } {
-  const apiBaseUrl = required(env, "RITA_API_BASE_URL");
-  const api = parseUrl(apiBaseUrl, "RITA_API_BASE_URL");
+function readApiBaseUrl(env: NodeJS.ProcessEnv, allowPrivateHttp: boolean): string {
+  const allowedHttp = allowPrivateHttp ? "loopback or private IPv4 HTTP" : "loopback HTTP";
+  const hint = `Set an HTTPS or ${allowedHttp} Rita API URL without credentials, a query, or a fragment`;
+  const apiBaseUrl = required(env, "RITA_API_BASE_URL", hint);
+  const api = parseUrl(apiBaseUrl, "RITA_API_BASE_URL", hint);
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(api.hostname);
   const allowsHttp = loopback || (allowPrivateHttp && isPrivateIPv4(api.hostname));
   if (!/^https?:\/\//i.test(apiBaseUrl) || apiBaseUrl.includes("?") ||
       (api.protocol !== "https:" && !(api.protocol === "http:" && allowsHttp))) {
-    const allowedHttp = allowPrivateHttp ? "loopback or private IPv4 HTTP" : "loopback HTTP";
-    throw new ConfigError("RITA_API_BASE_URL", `RITA_API_BASE_URL must use HTTPS or ${allowedHttp} and have no query`);
+    throw new ConfigError("RITA_API_BASE_URL", hint);
   }
+  return api.origin + api.pathname.replace(/\/+$/, "");
+}
 
-  const redirectUri = required(env, "RITA_REDIRECT_URI");
-  const redirect = parseUrl(redirectUri, "RITA_REDIRECT_URI");
+function readRedirectUri(env: NodeJS.ProcessEnv): string {
+  const hint = "Set the registered HTTPS or native callback URL with a host or path, without credentials or a fragment";
+  const redirectUri = required(env, "RITA_REDIRECT_URI", hint);
+  const redirect = parseUrl(redirectUri, "RITA_REDIRECT_URI", hint);
   const blockedSchemes = [
     "http:", "file:", "data:", "javascript:", "vbscript:", "blob:", "about:",
     "intent:", "content:", "ftp:", "ws:", "wss:", "mailto:", "tel:", "sms:",
   ];
   if (redirect.protocol === "https:" ? !/^https:\/\//i.test(redirectUri) :
       !/^[a-z][a-z0-9+.-]*:\//i.test(redirectUri) || blockedSchemes.includes(redirect.protocol)) {
-    throw new ConfigError("RITA_REDIRECT_URI", "RITA_REDIRECT_URI must be an HTTPS or native callback");
+    throw new ConfigError("RITA_REDIRECT_URI", hint);
   }
   if (!redirect.hostname && !redirect.pathname.startsWith("/")) {
-    throw new ConfigError("RITA_REDIRECT_URI", "RITA_REDIRECT_URI must have a host or path");
+    throw new ConfigError("RITA_REDIRECT_URI", hint);
   }
+  return redirectUri;
+}
 
+function readHost(env: NodeJS.ProcessEnv): string {
   const host = env.HOST ?? "127.0.0.1";
+  if (host !== "localhost" && !isIP(host)) throw new ConfigError("HOST", "Set localhost or a literal IP address");
+  return host;
+}
+
+function readPort(env: NodeJS.ProcessEnv): number {
   const portValue = env.PORT ?? "3005";
   const port = Number(portValue);
-  if (host !== "localhost" && !isIP(host)) throw new ConfigError("HOST", "Invalid HOST");
-  if (!/^[0-9]+$/.test(portValue) || port < 1 || port > 65535) throw new ConfigError("PORT", "Invalid PORT");
+  if (!/^[0-9]+$/.test(portValue) || port < 1 || port > 65535) {
+    throw new ConfigError("PORT", "Set an integer from 1 to 65535");
+  }
+  return port;
+}
 
+function readLogLevel(env: NodeJS.ProcessEnv) {
+  const level = env.LOG_LEVEL ?? "info";
+  if (level !== "info" && level !== "debug") throw new ConfigError("LOG_LEVEL", "Set info or debug");
+  return level;
+}
+
+function readDatabaseSynchronize(env: NodeJS.ProcessEnv, synchronizeByDefault: boolean): boolean {
+  const value = env.DATABASE_SYNCHRONIZE;
+  if (value === undefined) return synchronizeByDefault;
+  if (value !== "true" && value !== "false") {
+    throw new ConfigError("DATABASE_SYNCHRONIZE", "Set true or false, or omit this setting to use the command default");
+  }
+  return value === "true";
+}
+
+function ritaSettings(env: NodeJS.ProcessEnv, allowPrivateHttp: boolean) {
   return {
-    host, port, apiBaseUrl: api.origin + api.pathname.replace(/\/+$/, ""),
-    clientId: required(env, "RITA_CLIENT_ID"),
-    clientSecret: required(env, "RITA_CLIENT_SECRET"),
-    redirectUri,
+    apiBaseUrl: () => readApiBaseUrl(env, allowPrivateHttp),
+    redirectUri: () => readRedirectUri(env),
+    host: () => readHost(env),
+    port: () => readPort(env),
+    clientId: () => required(env, "RITA_CLIENT_ID", "Set the registered confidential client ID without surrounding whitespace"),
+    clientSecret: () => required(env, "RITA_CLIENT_SECRET", "Set the confidential client secret without surrounding whitespace"),
   };
+}
+
+function readSettings<T>(readers: { [K in keyof T]: () => T[K] }, collectErrors = false): T {
+  const values = {} as T;
+  const issues: ConfigIssue[] = [];
+  for (const name in readers) {
+    try {
+      values[name] = readers[name]();
+    } catch (error) {
+      if (!collectErrors || !(error instanceof ConfigError)) throw error;
+      issues.push({ setting: error.setting, hint: error.message });
+    }
+  }
+  const [first, ...rest] = issues;
+  if (first) throw new StartupConfigError([first, ...rest]);
+  return values;
+}
+
+export function readConfig(
+  env: NodeJS.ProcessEnv,
+  { allowPrivateHttp = false }: { allowPrivateHttp?: boolean } = {},
+): RitaConfig & { host: string; port: number } {
+  return readSettings(ritaSettings(env, allowPrivateHttp));
+}
+
+export function readStartupConfig(
+  env: NodeJS.ProcessEnv,
+  { allowPrivateHttp = false, synchronizeByDefault = false }: {
+    allowPrivateHttp?: boolean;
+    synchronizeByDefault?: boolean;
+  } = {},
+) {
+  return readSettings({
+    logLevel: () => readLogLevel(env),
+    ...ritaSettings(env, allowPrivateHttp),
+    replayKey: () => readReplayKey(env),
+    databaseUrl: () => readDatabaseUrl(env),
+    synchronize: () => readDatabaseSynchronize(env, synchronizeByDefault),
+  }, true);
 }

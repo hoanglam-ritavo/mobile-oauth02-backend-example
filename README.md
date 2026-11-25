@@ -10,7 +10,7 @@ Luồng trên thiết bị cần bản B có [route cấp quyền native](../rit
 
 ## Chạy thử
 
-Yêu cầu Node.js 24, npm và PostgreSQL. Tạo database dành riêng cho C. Role chạy migration cần quyền tạo bảng trong schema của C. Role runtime cần quyền đọc lịch sử migration và quyền đọc, ghi, xóa trong các bảng của C.
+Yêu cầu Node.js 24, npm và PostgreSQL. Tạo database dành riêng cho C. Với PostgreSQL cục bộ, có thể dùng database `rita_partner` và role đăng nhập `rita_partner` làm chủ database. Role đồng bộ schema cần quyền tạo và sửa bảng. Role chạy với auto-sync tắt cần quyền đọc, ghi và xóa dữ liệu trong các bảng của C.
 
 ```powershell
 npm ci
@@ -24,11 +24,20 @@ Tạo `OAUTH_REPLAY_KEY` riêng gồm 32 byte ở dạng base64url không paddin
 Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
 
 ```powershell
-npm run db:migrate
 npm run dev
 ```
 
-Migration có phiên bản và có thể chạy lại. C kiểm tra kết nối và phiên bản schema trước khi mở cổng HTTP. Khi nâng cấp từ bản RAM, người dùng bắt đầu một lượt đăng nhập mới để tạo ánh xạ user và phiên trong database.
+`npm run dev` mặc định dùng TypeORM để tạo hoặc đồng bộ ba bảng của C trước khi mở cổng HTTP. `npm start` mặc định chỉ kiểm tra schema. Có thể đặt `DATABASE_SYNCHRONIZE=true` hoặc `DATABASE_SYNCHRONIZE=false` trong `.env` để ghi đè mặc định của lệnh. Node ưu tiên biến đã có trong môi trường PowerShell.
+
+Để chuẩn bị schema cho bản build, chạy từ thư mục C.
+
+```powershell
+npm run db:sync
+npm run build
+npm start
+```
+
+`npm run db:sync` chỉ cần `DATABASE_URL`. Khi nâng cấp từ phiên bản đã dùng PostgreSQL, giữ database của C và `OAUTH_REPLAY_KEY` hiện có. Các entity TypeORM dùng tên bảng, cột và ràng buộc của schema cũ. Nếu `.env` có từ bản lưu trong RAM, điền `DATABASE_URL` và tạo khóa theo [.env.example](.env.example). Người dùng của bản RAM đăng nhập lại để tạo ánh xạ và phiên trong PostgreSQL.
 
 `npm start` chấp nhận HTTPS và HTTP qua loopback khi C gọi Rita. `npm run dev` chấp nhận thêm HTTP tới địa chỉ IPv4 riêng trong các dải `10.0.0.0/8`, `172.16.0.0/12` và `192.168.0.0/16`, ví dụ `http://172.16.0.10:4000`. Chỉ dùng HTTP nội bộ trên mạng phát triển được kiểm soát vì C gửi OAuth client secret khi đổi mã.
 
@@ -67,11 +76,11 @@ Access token của C có hạn 15 phút. Refresh token có hạn tuyệt đối 
 
 | Đường dẫn | Trách nhiệm |
 |---|---|
-| `index.ts` | Đọc cấu hình, nối các thành phần và đóng HTTP server cùng pool khi dừng. |
+| `index.ts` | Đọc cấu hình, nối các thành phần và đóng HTTP server cùng `DataSource` khi dừng. |
 | `src/auth/` | Xử lý attempt, đồng bộ user, phiên và mã hóa kết quả thử lại. |
 | `src/http/` | Routes, kiểm tra request và lỗi HTTP của C. |
 | `src/integrations/` | Đổi mã và đọc hồ sơ từ Rita. |
-| `src/database/` | Pool, transaction, migration và lưu trữ auth trên PostgreSQL. |
+| `src/database/` | Entity TypeORM, đồng bộ schema, transaction và lưu trữ auth trên PostgreSQL. |
 
 ## Đọc log khi kiểm tra đăng nhập
 
@@ -80,6 +89,8 @@ C ghi một đối tượng JSON trên mỗi dòng console. Mặc định `LOG_L
 | Dấu hiệu | Cách đọc |
 |---|---|
 | C chưa có `startup.listening` hoặc không thấy `http.request` cho `/api/mobile/auth/attempts` sau lần thử | Xem `startup.failed`, hoặc đối chiếu địa chỉ bind và port của C với địa chỉ D đang gọi. |
+| `startup.failed` với `INVALID_CONFIG` | Xem `issues` để đọc tên và hướng dẫn sửa của tất cả biến cấu hình bị lỗi. `setting` là biến bị lỗi đầu tiên. |
+| `startup.failed` với `DATABASE_NOT_READY` | Kiểm tra PostgreSQL, thông tin kết nối và quyền của role dành cho C. Nếu auto-sync đang tắt và schema cần cập nhật, chạy `npm run db:sync` trên database của C. |
 | `startup.callback_warning` với `rita_authorize_entry` hoặc `expo_go_authorize_entry` | C đang dùng link mở B làm callback. Đối chiếu callback về D với đăng ký OAuth tại A. Cấu hình native của demo ghi `callbackKind=partner_demo` trong `startup.listening`. |
 | `startup.listening` ghi `callbackKind=expo_go_callback` | C đang dùng URL `exp://` tới route `/--/redirect`. Đối chiếu URL này với `EXPO_PUBLIC_RITA_CALLBACK_URI` tại D và callback đăng ký cho client development tại A. |
 | `/attempts` trả `201` nhưng chưa thấy `/session` | Đây là kết quả đúng khi D đã nhận `access_denied` với `state` khớp. Nếu người dùng định đăng nhập tiếp, kiểm tra các bước mở B, xác thực callback hoặc cấp quyền tại A và nhận callback ở D. |
