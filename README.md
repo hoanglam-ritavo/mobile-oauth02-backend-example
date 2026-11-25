@@ -21,13 +21,13 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 
 Tạo `OAUTH_REPLAY_KEY` riêng gồm 32 byte ở dạng base64url không padding và giữ nguyên qua các lần restart. Khóa này mã hóa kết quả trả lại khi D thử lại. Thay khóa làm mất khả năng đọc các kết quả đã mã hóa bằng khóa cũ trong cửa sổ 60 giây, còn phiên đã cấp vẫn dùng được. Có thể tạo khóa bằng lệnh được ghi trong [file cấu hình mẫu](.env.example).
 
-Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
+Điền cấu hình của OAuth client **confidential** đã đăng ký tại A. Có thể dùng client độc lập hoặc gắn client với một Project cho demo. Nếu client có liên kết, A yêu cầu Project còn tồn tại, chưa bị xóa và có trạng thái `DEVELOPMENT` hoặc `PRODUCTION`. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
 
 ```powershell
 npm run dev
 ```
 
-`npm run dev` mặc định dùng TypeORM để tạo hoặc đồng bộ ba bảng của C trước khi mở cổng HTTP. `npm start` mặc định chỉ kiểm tra schema. Có thể đặt `DATABASE_SYNCHRONIZE=true` hoặc `DATABASE_SYNCHRONIZE=false` trong `.env` để ghi đè mặc định của lệnh. Node ưu tiên biến đã có trong môi trường PowerShell.
+`npm run dev` mặc định dùng TypeORM để tạo hoặc đồng bộ ba bảng của C trước khi mở cổng HTTP. `npm start` mặc định kiểm tra những thay đổi schema mà TypeORM còn cần áp dụng. Nếu schema chưa khớp, C dừng trước khi mở cổng HTTP và ghi `DATABASE_NOT_READY`. Có thể đặt `DATABASE_SYNCHRONIZE=true` hoặc `DATABASE_SYNCHRONIZE=false` trong `.env` để ghi đè mặc định của lệnh. Node ưu tiên biến đã có trong môi trường PowerShell.
 
 Để chuẩn bị schema cho bản build, chạy từ thư mục C.
 
@@ -37,7 +37,7 @@ npm run build
 npm start
 ```
 
-`npm run db:sync` chỉ cần `DATABASE_URL`. Khi nâng cấp từ phiên bản đã dùng PostgreSQL, giữ database của C và `OAUTH_REPLAY_KEY` hiện có. Các entity TypeORM dùng tên bảng, cột và ràng buộc của schema cũ. Nếu `.env` có từ bản lưu trong RAM, điền `DATABASE_URL` và tạo khóa theo [.env.example](.env.example). Người dùng của bản RAM đăng nhập lại để tạo ánh xạ và phiên trong PostgreSQL.
+`npm run db:sync` chỉ đọc `DATABASE_URL` để đồng bộ schema bằng TypeORM rồi đóng kết nối. Khi nâng cấp từ phiên bản đã dùng PostgreSQL, giữ database của C và `OAUTH_REPLAY_KEY` hiện có. Các entity TypeORM dùng tên bảng, cột và ràng buộc của schema PostgreSQL trước đó. Nếu `.env` có từ bản lưu trong RAM, điền `DATABASE_URL` và tạo khóa theo [.env.example](.env.example). Người dùng của bản RAM đăng nhập lại để tạo ánh xạ và phiên trong PostgreSQL.
 
 `npm start` chấp nhận HTTPS và HTTP qua loopback khi C gọi Rita. `npm run dev` chấp nhận thêm HTTP tới địa chỉ IPv4 riêng trong các dải `10.0.0.0/8`, `172.16.0.0/12` và `192.168.0.0/16`, ví dụ `http://172.16.0.10:4000`. Chỉ dùng HTTP nội bộ trên mạng phát triển được kiểm soát vì C gửi OAuth client secret khi đổi mã.
 
@@ -59,7 +59,9 @@ C đọc `RITA_REDIRECT_URI` từ cấu hình và trả giá trị này dưới 
 | `GET /api/mobile/me` | `Authorization: Bearer <accessToken của C>` | `200` với `{ user }` |
 | `POST /api/mobile/auth/logout` | `{ refreshToken }` | `204`, kể cả khi phiên đã đóng |
 
-Ví dụ hồ sơ trong phản hồi là `{ "id": "34db4043-e171-4907-ace6-f830d4604211", "name": "Nhân viên mẫu", "email": "employee@example.invalid" }`. C liên kết theo UUID Rita `_id` từ `userinfo` và cập nhật tên/email mỗi lần đăng nhập. `id` trong phản hồi là UUID của C. Chỉ nhân viên Rita đang hoạt động được cấp phiên.
+Ví dụ hồ sơ trong phản hồi là `{ "id": "34db4043-e171-4907-ace6-f830d4604211", "name": "Nhân viên mẫu", "email": "employee@example.invalid" }`. Khi hoàn tất một lần đăng nhập mới, C lấy hồ sơ từ `userinfo` rồi tạo hoặc cập nhật tên và email theo UUID Rita `_id`. C cấp UUID nội bộ khi tạo user và giữ lại UUID đó khi cập nhật. `id` trong phản hồi là UUID nội bộ này. Chỉ nhân viên Rita đang hoạt động được cấp phiên.
+
+`GET /api/mobile/me`, refresh và logout xử lý phiên bằng dữ liệu PostgreSQL của C. Sau lần đăng nhập mới thành công, thay đổi tên hoặc email tại Rita xuất hiện cả trong các phiên C còn hiệu lực từ trước. Nếu tài khoản Rita bị vô hiệu hóa, lần đăng nhập Rita kế tiếp sẽ không được cấp phiên mới. Phiên C đang hoạt động có thể tiếp tục đến khi logout hoặc hết hạn.
 
 D giữ verifier trong giao dịch đang chờ, rồi mở B với `client_id`, `redirect_uri`, `scope`, `state`, `response_type=code`, `code_challenge` và `code_challenge_method=S256`. D kiểm tra URI và `state` của callback. Callback mang mã hợp lệ dẫn đến `POST /api/mobile/auth/session`. Với callback `access_denied` có `state` khớp, D xóa giao dịch đang chờ trên app và kết thúc luồng tại đó. Giao dịch đã tạo ở C hết hiệu lực 10 phút sau khi tạo và được xóa khi C chạy dọn dẹp.
 
@@ -68,7 +70,7 @@ Access token của C có hạn 15 phút. Refresh token có hạn tuyệt đối 
 ### Thử lại và lỗi
 
 - Giao dịch ở C có hạn 10 phút. Mã OAuth do Rita cấp có hạn 120 giây kể từ lúc phát hành.
-- Nếu D mất phản hồi hoàn tất, có thể gửi lại đúng dữ liệu của lần gọi cũ. C trả lại cùng cặp token trong 60 giây kể từ lúc cấp, kể cả khi C đã restart. PostgreSQL lưu bản kết quả đã mã hóa, còn kho phiên lưu hash của hai token. Refresh hoặc logout kết thúc cửa sổ trả lại.
+- Nếu D mất phản hồi hoàn tất, có thể gửi lại đúng `attemptId`, `state`, `code` và `codeVerifier`. C trả lại kết quả đã lưu trong 60 giây kể từ lúc cấp, kể cả sau khi C restart với cùng PostgreSQL và `OAUTH_REPLAY_KEY`. Lần gửi lại dùng kết quả ở PostgreSQL của C. Bảng giao dịch lưu kết quả đã mã hóa, còn bảng phiên lưu hash của hai token. Refresh hoặc logout kết thúc cửa sổ trả lại.
 - `LOGIN_RESTART_REQUIRED` và `RITA_LOGIN_RESTART_REQUIRED` yêu cầu bắt đầu đăng nhập mới. Mỗi lần đổi mã có quyền xử lý tối đa 15 giây. Nếu C dừng khi kết quả từ Rita chưa được ghi, attempt yêu cầu đăng nhập mới khi hết thời hạn này. Nếu D mất phản hồi refresh, D đăng nhập lại.
 - Lỗi có dạng `{ error, requestId }`. `LOGIN_PROOF_MISMATCH` trả 400, `LOGIN_ATTEMPT_CONFLICT` trả 409, `RITA_ACCOUNT_INELIGIBLE` trả 403 và `INVALID_SESSION` trả 401. `CAPACITY_EXCEEDED` trả 503 khi hết chỗ hoặc khi đợi lần đổi mã trước quá 8 giây. Trường hợp chờ có `Retry-After: 1`. `USER_CAPACITY_EXCEEDED` báo đã đủ 1.000 user. Giới hạn cũng là 1.000 attempt còn hạn, 1.000 phiên hoặc lượt cấp phiên đang xử lý, và tối đa 20 lần đổi mã đồng thời.
 
@@ -107,12 +109,17 @@ npm test
 npm run build
 ```
 
-Ngày 2026-11-20, typecheck, build và **10/10 test** đã qua ở C. Bộ test dùng hồ sơ hư cấu và gồm ca chạy HTTP qua Rita giả lập để kiểm tra đổi mã một lần, truy cập `/me`, refresh và logout.
+Suite [`test/mobile.test.ts`](test/mobile.test.ts) dùng kho trong bộ nhớ và Rita giả lập để kiểm tra cấu hình, hợp đồng HTTP, PKCE và phiên. Suite [`test/postgres.test.ts`](test/postgres.test.ts) chạy trên TypeORM và PostgreSQL để kiểm tra đồng bộ schema mới và schema có dữ liệu, mở lại kết nối và dịch vụ, thử lại kết quả đã mã hóa, cập nhật hồ sơ khi đăng nhập mới và refresh/logout trên phiên đã lưu.
 
 Đặt `C_TEST_DATABASE_URL` trong tiến trình test để chạy suite PostgreSQL. Dùng database tạm với quyền tạo schema. Suite tự tạo và dọn schema riêng, dùng hồ sơ hư cấu và Rita giả lập. Suite được đánh dấu skip khi biến này vắng mặt.
 
-Ngày 2026-11-25, typecheck, build và **31 test** đã qua, gồm **6 test** với PostgreSQL 17.11 cô lập. Kiểm tra thêm bản build qua hai lần restart tiến trình, xác nhận attempt, kết quả thử lại, `/me` và refresh tiếp tục hoạt động với Rita giả lập. Kiểm thử chuyển app trên thiết bị vẫn chờ nghiệm thu.
+### Kết quả kiểm thử hiện tại
 
-Phiên trong C hết hạn theo chính sách riêng. Nếu tài khoản Rita bị vô hiệu hóa, lần đăng nhập Rita kế tiếp sẽ không được cấp phiên mới. Phiên C đang hoạt động có thể tiếp tục đến khi logout hoặc hết hạn.
+Ngày 2026-11-25, bản `ff10d69` cùng thay đổi tài liệu và test hồi quy đã qua typecheck, build và **27 test** cấu hình, HTTP và phiên. Sandbox chặn `spawnSync` trong nhóm startup. Cả **2 tình huống** của nhóm này đã qua khi chạy trực tiếp `index.ts` với cấu hình giả lập.
 
-Lần đồng bộ tài liệu ngày 2026-11-20 đã kiểm tra đường dẫn, liên kết và thông tin API với mã nguồn. Kết quả test ở trên thuộc lần kiểm chứng backend trước đó.
+Cả **7 test PostgreSQL 17.11 cô lập** đã qua. Suite chạy đồng bộ TypeORM qua `DataSource` và mô phỏng restart bằng cách mở lại dịch vụ HTTP cùng kết nối PostgreSQL. Kiểm tra riêng đã chạy `node src/database/sync.ts` hai lần trên cùng một database PostgreSQL 17.11 cô lập vừa tạo, rồi xác nhận `assertSchema` thành công với tùy chọn đồng bộ schema tắt. Kiểm thử chuyển app trên thiết bị vẫn chờ nghiệm thu.
+
+### Kết quả kiểm thử trước đây
+
+- Ngày 2026-11-20, typecheck, build và **10/10 test** đã qua ở phiên bản cũ. Bộ test dùng hồ sơ hư cấu và gồm ca chạy HTTP qua Rita giả lập để kiểm tra đổi mã một lần, truy cập `/me`, refresh và logout.
+- Ngày 2026-11-25, phiên bản `fa619f8` ghi nhận typecheck, build và **31 test** đã qua, gồm **6 test** với PostgreSQL 17.11 cô lập. Lần kiểm chứng đó cũng chạy bản build qua hai lần restart tiến trình với Rita giả lập để kiểm tra attempt, kết quả thử lại, `/me` và refresh.

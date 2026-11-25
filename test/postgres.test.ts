@@ -166,18 +166,22 @@ testPostgres("schema synchronization is repeatable and HTTP retries, refresh and
   const differentKey = authService(last, rita, Date.now, Buffer.alloc(32, 5));
   await assert.rejects(differentKey.complete(input), /RITA_LOGIN_RESTART_REQUIRED/);
 
+  profileAtRita = { ...profile, name: "Tên mới", email: "updated@example.invalid" };
+  assert.deepEqual(await response(await afterIssuance.me(issued.accessToken), 200), { user: issued.user });
   const refreshed = await response<SessionResponse>(
     await afterIssuance.post("/auth/refresh", { refreshToken: issued.refreshToken }), 200);
+  assert.deepEqual(refreshed.user, issued.user);
   assert.notEqual(refreshed.refreshToken, issued.refreshToken);
   assert.equal(refreshed.refreshExpiresAt, issued.refreshExpiresAt);
   assert.equal((await afterIssuance.me(issued.accessToken)).status, 401);
   assert.equal((await afterIssuance.post("/auth/session", input)).status, 401);
-  profileAtRita = { ...profile, name: "Tên mới", email: "updated@example.invalid" };
+  assert.equal(exchanges, 1);
+
   const next = await response<{ attemptId: string; state: string }>(
     await afterIssuance.post("/auth/attempts", { codeChallenge: challenge }), 201);
   const signedIn = await response<SessionResponse>(
     await afterIssuance.post("/auth/session", completion(next, "next-code")), 200);
-  assert.equal(signedIn.user.id, issued.user.id);
+  assert.deepEqual(signedIn.user, { id: issued.user.id, name: profileAtRita.name, email: profileAtRita.email });
   assert.notEqual(signedIn.user.id, profile.id);
   assert.deepEqual(await response(await afterIssuance.me(refreshed.accessToken), 200), { user: signedIn.user });
   for (let i = 0; i < 2; i++) {
