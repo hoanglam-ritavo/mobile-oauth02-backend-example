@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
-import type { RitaConfig } from "./config.ts";
-import { AuthError } from "./errors.ts";
-import { durationMs, type AttemptLog, type RitaOutcome } from "./logger.ts";
+import type { RitaConfig } from "../config.ts";
+import { AuthError } from "../errors.ts";
+import { durationMs, type AttemptLog, type RitaOutcome } from "../logger.ts";
 
 export interface RitaUser {
   id: string;

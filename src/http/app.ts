@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import express, { type ErrorRequestHandler, type Request, type Response } from "express";
-import { AuthError } from "./errors.ts";
-import { createLogger, durationMs, type Logger, type RequestLog } from "./logger.ts";
-import type { MobileAuth } from "./mobile-auth.ts";
+import type { MobileAuth } from "../auth/mobile-auth.ts";
+import { AuthError } from "../errors.ts";
+import { createLogger, durationMs, type Logger, type RequestLog } from "../logger.ts";
 
 const randomToken = /^[A-Za-z0-9_-]{43}$/;
 const verifier = /^[A-Za-z0-9._~-]{43,128}$/;
@@ -87,9 +87,9 @@ export function createApp(auth: MobileAuth, logger: Logger = createLogger()) {
   });
   app.use(express.json({ limit: "4kb" }));
 
-  app.post(routes.attempts, (req, res) => {
+  app.post(routes.attempts, async (req, res) => {
     const { codeChallenge } = payload(req, { codeChallenge: randomToken });
-    const attempt = auth.start(codeChallenge);
+    const attempt = await auth.start(codeChallenge);
     httpLog(res).attemptId = attempt.attemptId;
     res.status(201).json(attempt);
   });
@@ -101,16 +101,16 @@ export function createApp(auth: MobileAuth, logger: Logger = createLogger()) {
       attemptId: body.attemptId, state: body.state, code: body.code, codeVerifier: body.codeVerifier,
     }, httpLog(res)));
   });
-  app.post(routes.refresh, (req, res) => {
+  app.post(routes.refresh, async (req, res) => {
     const { refreshToken } = payload(req, { refreshToken: randomToken });
-    res.json(auth.refresh(refreshToken));
+    res.json(await auth.refresh(refreshToken));
   });
-  app.get(routes.me, (req, res) => {
-    res.json({ user: auth.me(accessToken(req)) });
+  app.get(routes.me, async (req, res) => {
+    res.json({ user: await auth.me(accessToken(req)) });
   });
-  app.post(routes.logout, (req, res) => {
+  app.post(routes.logout, async (req, res) => {
     const { refreshToken } = payload(req, { refreshToken: randomToken });
-    auth.logout(refreshToken);
+    await auth.logout(refreshToken);
     res.status(204).end();
   });
 
@@ -131,6 +131,7 @@ export function createApp(auth: MobileAuth, logger: Logger = createLogger()) {
           ? invalidRequest()
           : new AuthError(500, "INTERNAL_ERROR");
     context.errorCode = failure.code;
+    if (failure.retryAfter !== undefined) res.set("Retry-After", String(failure.retryAfter));
     res.status(failure.status).json({ error: failure.code, requestId: context.requestId });
   };
   app.use(onError);

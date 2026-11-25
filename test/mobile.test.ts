@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import { createServer, request as httpRequest, type RequestListener } from "node:http";
 import { test, type TestContext } from "node:test";
 import express from "express";
-import { createApp } from "../src/app.ts";
-import { readConfig } from "../src/config.ts";
+import { Client } from "pg";
+import { MobileAuth } from "../src/auth/mobile-auth.ts";
+import { readConfig, readDatabaseUrl, readReplayKey } from "../src/config.ts";
 import { AuthError } from "../src/errors.ts";
+import { createApp } from "../src/http/app.ts";
+import { createRitaClient, type RitaClient } from "../src/integrations/rita.ts";
 import { callbackKind, createLogger, type LogEvent, type LogLevel } from "../src/logger.ts";
-import { MobileAuth } from "../src/mobile-auth.ts";
-import { createRitaClient, type RitaClient } from "../src/rita.ts";
+import { createMemoryStore } from "./fixtures/memory-store.ts";
 
 const configEnv = {
   RITA_API_BASE_URL: "https://id.example.invalid/api/",
@@ -21,6 +23,31 @@ const verifier = "a".repeat(43);
 const challenge = createHash("sha256").update(verifier).digest("base64url");
 const profile = { id: "29dc350d-1a0c-4085-919d-6d234af8dd73", name: "Nhân viên", email: "employee@example.invalid" };
 const startTime = Date.parse("2030-01-01T00:00:00Z");
+const replayKey = Buffer.alloc(32, 7);
+
+test("database URL and canonical replay key are required by the persistence configuration", () => {
+  assert.throws(() => readDatabaseUrl({}), { setting: "DATABASE_URL" });
+  for (const value of ["https://example.invalid/partner", "postgresql://localhost/partner", "postgres://c@localhost/"]) {
+    assert.throws(() => readDatabaseUrl({ DATABASE_URL: value }), { setting: "DATABASE_URL" });
+  }
+  const databaseUrl = "postgresql://fixture-user:fixture-password@localhost/partner";
+  assert.equal(readDatabaseUrl({ DATABASE_URL: databaseUrl }), databaseUrl);
+  assert.throws(() => readReplayKey({}), { setting: "OAUTH_REPLAY_KEY" });
+  assert.throws(() => readReplayKey({ OAUTH_REPLAY_KEY: replayKey.toString("base64") }), { setting: "OAUTH_REPLAY_KEY" });
+  assert.deepEqual(readReplayKey({ OAUTH_REPLAY_KEY: replayKey.toString("base64url") }), replayKey);
+});
+
+test("database URL preserves a password containing @ for pg", () => {
+  for (const passwordInUri of ["one%40two", "one@two"]) {
+    const databaseUrl = `postgresql://fixture-user:${passwordInUri}@localhost/partner`;
+    const connectionString = readDatabaseUrl({ DATABASE_URL: databaseUrl });
+    assert.equal(connectionString, databaseUrl);
+    const client = new Client({ connectionString });
+    assert.equal(client.password, "one@two");
+    assert.equal(client.host, "localhost");
+    assert.equal(client.database, "partner");
+  }
+});
 
 test("private IPv4 Rita API URLs require development opt-in for HTTP", () => {
   for (const hostname of ["10.0.0.2", "172.16.6.209", "172.31.255.254", "192.168.1.10"]) {
@@ -51,12 +78,14 @@ test("HTTPS and HTTP loopback Rita API URLs work by default", () => {
 
 function fixture(rita: RitaClient = { identify: async () => profile }) {
   let time = startTime;
-  const auth = new MobileAuth(config, rita, () => time);
+  const store = createMemoryStore();
+  const newService = () => new MobileAuth(config, rita, store, replayKey, () => time);
+  const auth = newService();
   return {
-    auth,
+    auth, newService,
     advance: (milliseconds: number) => { time += milliseconds; },
-    start: (code = "example-code") => {
-      const { attemptId, state } = auth.start(challenge);
+    start: async (code = "example-code") => {
+      const { attemptId, state } = await auth.start(challenge);
       return { attemptId, state, code, codeVerifier: verifier };
     },
   };
@@ -65,11 +94,11 @@ function fixture(rita: RitaClient = { identify: async () => profile }) {
 test("proof and expiry checks precede any request to Rita", async () => {
   let calls = 0;
   const { auth, start, advance } = fixture({ identify: async () => { calls++; return profile; } });
-  const attempt = start();
-  assert.throws(() => auth.complete({ ...attempt, state: "wrong" }), /LOGIN_PROOF_MISMATCH/);
-  assert.throws(() => auth.complete({ ...attempt, codeVerifier: "b".repeat(43) }), /LOGIN_PROOF_MISMATCH/);
+  const attempt = await start();
+  await assert.rejects(auth.complete({ ...attempt, state: "wrong" }), /LOGIN_PROOF_MISMATCH/);
+  await assert.rejects(auth.complete({ ...attempt, codeVerifier: "b".repeat(43) }), /LOGIN_PROOF_MISMATCH/);
   advance(10 * 60_000);
-  assert.throws(() => auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
+  await assert.rejects(auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
   assert.equal(calls, 0);
 });
 
@@ -77,25 +106,27 @@ test("concurrent and repeated completion return one token pair", async () => {
   let calls = 0;
   const { promise, resolve } = Promise.withResolvers<typeof profile>();
   const { auth, start, advance } = fixture({ identify: () => { calls++; return promise; } });
-  const attempt = start();
+  const attempt = await start();
   const first = auth.complete(attempt);
   const second = auth.complete(attempt);
-  assert.throws(() => auth.complete({ ...attempt, code: "different-code" }), /LOGIN_ATTEMPT_CONFLICT/);
+  await assert.rejects(auth.complete({ ...attempt, code: "different-code" }), /LOGIN_ATTEMPT_CONFLICT/);
   resolve(profile);
   const result = await first;
   assert.deepEqual(await second, result);
   assert.deepEqual(await auth.complete(attempt), result);
   assert.equal(calls, 1);
   advance(60_000);
-  auth.prune();
-  assert.throws(() => auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
-  assert.deepEqual(auth.me(result.accessToken), result.user);
+  await auth.prune();
+  await assert.rejects(auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
+  assert.deepEqual(await auth.me(result.accessToken), result.user);
 });
 
 test("a late Rita response cannot create a session for an expired attempt", async () => {
   const { promise, resolve } = Promise.withResolvers<typeof profile>();
-  const { auth, start, advance } = fixture({ identify: () => promise });
-  const pending = auth.complete(start());
+  const { promise: started, resolve: markStarted } = Promise.withResolvers<void>();
+  const { auth, start, advance } = fixture({ identify: () => { markStarted(); return promise; } });
+  const pending = auth.complete(await start());
+  await started;
   advance(10 * 60_000);
   resolve(profile);
   await assert.rejects(pending, /LOGIN_RESTART_REQUIRED/);
@@ -104,55 +135,55 @@ test("a late Rita response cannot create a session for an expired attempt", asyn
 test("ambiguous upstream failure closes the attempt without repeating the exchange", async () => {
   let calls = 0;
   const { auth, start } = fixture({ identify: () => { calls++; throw new Error("fictional transport error"); } });
-  const attempt = start();
+  const attempt = await start();
   await assert.rejects(auth.complete(attempt), /RITA_LOGIN_RESTART_REQUIRED/);
-  assert.throws(() => auth.complete(attempt), /RITA_LOGIN_RESTART_REQUIRED/);
+  await assert.rejects(auth.complete(attempt), /RITA_LOGIN_RESTART_REQUIRED/);
   assert.equal(calls, 1);
 });
 
 test("new email syncs by Rita UUID and is visible to established sessions", async () => {
   let upstream = { ...profile };
   const { auth, start } = fixture({ identify: async () => upstream });
-  const first = await auth.complete(start());
+  const first = await auth.complete(await start());
   upstream = { ...profile, name: "Tên cập nhật", email: "updated@example.invalid" };
-  const second = await auth.complete(start("next-code"));
+  const second = await auth.complete(await start("next-code"));
   assert.equal(first.user.id, second.user.id);
   assert.notEqual(second.user.id, profile.id);
-  assert.deepEqual(auth.me(first.accessToken), second.user);
+  assert.deepEqual(await auth.me(first.accessToken), second.user);
   upstream = { ...upstream, id: "5c845a02-1075-4b4e-84de-560792b7b0e6" };
-  assert.notEqual((await auth.complete(start("different-uuid"))).user.id, second.user.id);
+  assert.notEqual((await auth.complete(await start("different-uuid"))).user.id, second.user.id);
 });
 
 test("refresh rotates both tokens, ends login replay and preserves the absolute deadline", async () => {
   const { auth, start, advance } = fixture();
-  const attempt = start();
+  const attempt = await start();
   const first = await auth.complete(attempt);
   advance(30_000);
-  const second = auth.refresh(first.refreshToken);
+  const second = await auth.refresh(first.refreshToken);
   assert.notEqual(second.accessToken, first.accessToken);
   assert.notEqual(second.refreshToken, first.refreshToken);
   assert.equal(second.refreshExpiresAt, first.refreshExpiresAt);
-  assert.throws(() => auth.refresh(first.refreshToken), /INVALID_SESSION/);
-  assert.throws(() => auth.me(first.accessToken), /INVALID_SESSION/);
-  assert.throws(() => auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
+  await assert.rejects(auth.refresh(first.refreshToken), /INVALID_SESSION/);
+  await assert.rejects(auth.me(first.accessToken), /INVALID_SESSION/);
+  await assert.rejects(auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
   advance(15 * 60_000);
-  assert.throws(() => auth.me(second.accessToken), /INVALID_SESSION/);
-  const third = auth.refresh(second.refreshToken);
+  await assert.rejects(auth.me(second.accessToken), /INVALID_SESSION/);
+  const third = await auth.refresh(second.refreshToken);
   advance(24 * 60 * 60_000);
-  auth.prune();
-  assert.throws(() => auth.refresh(third.refreshToken), /INVALID_SESSION/);
+  await auth.prune();
+  await assert.rejects(auth.refresh(third.refreshToken), /INVALID_SESSION/);
 });
 
-test("logout and restart invalidate credentials", async () => {
-  const { auth, start } = fixture();
-  const attempt = start();
+test("a recreated service can read the same store, while logout invalidates credentials", async () => {
+  const { auth, start, newService } = fixture();
+  const attempt = await start();
   const session = await auth.complete(attempt);
-  assert.throws(() => fixture().auth.me(session.accessToken), /INVALID_SESSION/);
-  auth.logout(session.refreshToken);
-  auth.logout(session.refreshToken);
-  assert.throws(() => auth.me(session.accessToken), /INVALID_SESSION/);
-  assert.throws(() => auth.refresh(session.refreshToken), /INVALID_SESSION/);
-  assert.throws(() => auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
+  assert.deepEqual(await newService().me(session.accessToken), session.user);
+  await auth.logout(session.refreshToken);
+  await auth.logout(session.refreshToken);
+  await assert.rejects(auth.me(session.accessToken), /INVALID_SESSION/);
+  await assert.rejects(auth.refresh(session.refreshToken), /INVALID_SESSION/);
+  await assert.rejects(auth.complete(attempt), /LOGIN_RESTART_REQUIRED/);
 });
 
 test("Rita sends confidential credentials only on token exchange and maps UserInfo", async () => {
@@ -238,7 +269,7 @@ async function verifyOAuthHttpContract(context: TestContext, callbackUri: string
     RITA_API_BASE_URL: ritaOrigin + "/api", RITA_CLIENT_ID: config.clientId, RITA_CLIENT_SECRET: config.clientSecret,
     RITA_REDIRECT_URI: callbackUri,
   });
-  const auth = new MobileAuth(scenarioConfig, createRitaClient(scenarioConfig), () => startTime);
+  const auth = new MobileAuth(scenarioConfig, createRitaClient(scenarioConfig), createMemoryStore(), replayKey, () => startTime);
   const logs = captureLogs("debug");
   const cOrigin = await serve(context, createApp(auth, logs.logger));
   const request = (path: string, options?: RequestInit) => fetch(cOrigin + "/api/mobile" + path, options);
@@ -339,7 +370,7 @@ test("HTTP logs identify malformed and unknown requests without trusting headers
     body: '{"unparsed":"payload-marker"',
   });
   const unknown = await fetch(origin + "/unknown-path-marker");
-  const { attemptId, state } = auth.start(challenge);
+  const { attemptId, state } = await auth.start(challenge);
   const invalidProof = await fetch(origin + "/api/mobile/auth/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -379,20 +410,26 @@ test("an interrupted request produces one early-close summary", { timeout: 3_000
     if (entry.event === "http.request" && entry.outcome === "closed_early") markClosed();
   });
   const origin = await serve(context, createApp(auth, logger));
-  const completion = start();
+  const completion = await start();
   const req = httpRequest(origin + "/api/mobile/auth/session", {
     method: "POST", headers: { "Content-Type": "application/json" },
   });
   req.on("error", () => {});
+  let draining: Promise<void> | undefined;
   try {
     req.end(JSON.stringify(completion));
     await exchangeStarted;
     req.destroy();
     await closed;
+    let drained = false;
+    draining = auth.drain().then(() => { drained = true; });
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    assert.equal(drained, false);
   } finally {
     req.destroy();
     completeExchange(profile);
   }
+  await draining;
   await auth.complete(completion);
   const summaries = events.filter(entry => entry.event === "http.request");
   assert.equal(summaries.length, 1);
@@ -420,7 +457,7 @@ test("Rita log outcomes explain mapped errors and failed completions keep their 
       const { auth, start } = fixture(createRitaClient(config, item.fetch));
       const logs = captureLogs("debug");
       const origin = await serve(subtest, createApp(auth, logs.logger));
-      const completion = start();
+      const completion = await start();
       const send = () => fetch(origin + "/api/mobile/auth/session", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(completion),
       });

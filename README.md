@@ -1,24 +1,34 @@
 # Backend C — Đăng nhập Rita Võ ID
 
-Backend ví dụ dành cho app đối tác D. Express và TypeScript chạy trong một tiến trình. User, giao dịch đăng nhập và phiên nằm trong RAM. Mỗi lần restart, D phải đăng nhập lại và user được tạo lại với ID nội bộ mới. Bản này dành cho thử nghiệm, với một instance và một nhóm người dùng nhỏ.
+Backend ví dụ dành cho app đối tác D. Express và TypeScript chạy trong một tiến trình. PostgreSQL riêng của C lưu user, giao dịch đang chờ và phiên đăng nhập. C giữ nguyên ID nội bộ của cùng một user Rita qua các lần đăng nhập và restart.
 
 ## Vai trò trong luồng mobile
 
 C nhận mã và PKCE verifier từ [D — app đối tác](../oauth02-mobile-integration-example/README.md). C giữ secret của client `confidential`, dùng `POST /auth/oauth/token` để đổi mã với A và gọi `GET /auth/oauth/userinfo` để lấy hồ sơ. C dùng `_id` của Rita để liên kết user. Phiên và UUID trả cho D do C cấp. Xem [ranh giới OAuth của A](../rita-id-backend/ARCHITECTURE.md#partner-mobile-authorization).
 
-Luồng trên thiết bị cần bản B có [route cấp quyền native](../rita-id-app/ARCHITECTURE.md#planned-partner-mobile-authorization). C và D dùng callback `rita-partner-demo://redirect`, trùng chính xác với đăng ký ở A. Cần cấu hình client, cài B và D rồi thực hiện [các ca nghiệm thu Android và iOS](../oauth02-mobile-integration-example/README.md#phase-2-acceptance-checklist).
+Luồng trên thiết bị cần bản B có [route cấp quyền native](../rita-id-app/ARCHITECTURE.md#partner-mobile-authorization). C và D dùng callback `rita-partner-demo://redirect`, trùng chính xác với đăng ký ở A. Cần cấu hình client, cài B và D rồi thực hiện [các ca nghiệm thu Android và iOS](../oauth02-mobile-integration-example/README.md#phase-2-acceptance-checklist).
 
 ## Chạy thử
 
-Yêu cầu Node.js 24 và npm.
+Yêu cầu Node.js 24, npm và PostgreSQL. Tạo database dành riêng cho C. Role chạy migration cần quyền tạo bảng trong schema của C. Role runtime cần quyền đọc lịch sử migration và quyền đọc, ghi, xóa trong các bảng của C.
 
 ```powershell
 npm ci
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+Điền `DATABASE_URL` trỏ tới database C và dùng TLS được xác thực khi kết nối từ xa. Nếu mật khẩu có dấu `@`, mã hóa dấu đó thành `%40` trong phần mật khẩu của URI. Mã hóa mỗi ký tự một lần và giữ nguyên dấu `@` phân cách trước host. Ví dụ với mật khẩu giả lập `one@two` là `postgresql://user:one%40two@localhost/db`. Mật khẩu ở PostgreSQL vẫn là `one@two`.
+
+Tạo `OAUTH_REPLAY_KEY` riêng gồm 32 byte ở dạng base64url không padding và giữ nguyên qua các lần restart. Khóa này mã hóa kết quả trả lại khi D thử lại. Thay khóa làm mất khả năng đọc các kết quả đã mã hóa bằng khóa cũ trong cửa sổ 60 giây, còn phiên đã cấp vẫn dùng được. Có thể tạo khóa bằng lệnh được ghi trong [file cấu hình mẫu](.env.example).
+
+Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
+
+```powershell
+npm run db:migrate
 npm run dev
 ```
 
-Dùng `Copy-Item` khi chưa có `.env`. Điền cấu hình của OAuth client **confidential** đã gắn với Project trên Rita. Đặt `RITA_REDIRECT_URI=rita-partner-demo://redirect` để khớp chính xác callback trong đăng ký OAuth của client tại A. B mở callback này để quay về D. `RITA_API_BASE_URL` kết thúc trước `/auth/oauth`. Giữ `/api` trong URL nếu dùng proxy có tiền tố đó.
+Migration có phiên bản và có thể chạy lại. C kiểm tra kết nối và phiên bản schema trước khi mở cổng HTTP. Khi nâng cấp từ bản RAM, người dùng bắt đầu một lượt đăng nhập mới để tạo ánh xạ user và phiên trong database.
 
 `npm start` chấp nhận HTTPS và HTTP qua loopback khi C gọi Rita. `npm run dev` chấp nhận thêm HTTP tới địa chỉ IPv4 riêng trong các dải `10.0.0.0/8`, `172.16.0.0/12` và `192.168.0.0/16`, ví dụ `http://172.16.0.10:4000`. Chỉ dùng HTTP nội bộ trên mạng phát triển được kiểm soát vì C gửi OAuth client secret khi đổi mã.
 
@@ -49,9 +59,19 @@ Access token của C có hạn 15 phút. Refresh token có hạn tuyệt đối 
 ### Thử lại và lỗi
 
 - Giao dịch ở C có hạn 10 phút. Mã OAuth do Rita cấp có hạn 120 giây kể từ lúc phát hành.
-- Nếu D mất phản hồi hoàn tất, có thể gửi lại đúng dữ liệu của lần gọi cũ. C gộp các lần gọi đồng thời và có thể trả lại cùng cặp token trong 60 giây kể từ lúc cấp. Refresh hoặc logout kết thúc cửa sổ này. C chỉ giữ kết quả có token nguyên văn trong cửa sổ trả lại ngắn. Kho phiên dùng bản băm.
-- `LOGIN_RESTART_REQUIRED` và `RITA_LOGIN_RESTART_REQUIRED` yêu cầu bắt đầu đăng nhập mới. C giữ kết quả lỗi của lần đổi mã và tránh gửi lại mã sang Rita khi kết quả không xác định. Nếu D mất phản hồi refresh, D đăng nhập lại.
-- Lỗi có dạng `{ error, requestId }`. `LOGIN_PROOF_MISMATCH` trả 400, `LOGIN_ATTEMPT_CONFLICT` trả 409, `RITA_ACCOUNT_INELIGIBLE` trả 403 và `INVALID_SESSION` trả 401. `CAPACITY_EXCEEDED` trả 503 trước khi đổi mã, nên lần hoàn tất có thể gửi lại trong hạn. `USER_CAPACITY_EXCEEDED` báo kho user của tiến trình đã đầy. Giới hạn là 1.000 bản ghi cho mỗi kho và 20 lần đổi mã đồng thời.
+- Nếu D mất phản hồi hoàn tất, có thể gửi lại đúng dữ liệu của lần gọi cũ. C trả lại cùng cặp token trong 60 giây kể từ lúc cấp, kể cả khi C đã restart. PostgreSQL lưu bản kết quả đã mã hóa, còn kho phiên lưu hash của hai token. Refresh hoặc logout kết thúc cửa sổ trả lại.
+- `LOGIN_RESTART_REQUIRED` và `RITA_LOGIN_RESTART_REQUIRED` yêu cầu bắt đầu đăng nhập mới. Mỗi lần đổi mã có quyền xử lý tối đa 15 giây. Nếu C dừng khi kết quả từ Rita chưa được ghi, attempt yêu cầu đăng nhập mới khi hết thời hạn này. Nếu D mất phản hồi refresh, D đăng nhập lại.
+- Lỗi có dạng `{ error, requestId }`. `LOGIN_PROOF_MISMATCH` trả 400, `LOGIN_ATTEMPT_CONFLICT` trả 409, `RITA_ACCOUNT_INELIGIBLE` trả 403 và `INVALID_SESSION` trả 401. `CAPACITY_EXCEEDED` trả 503 khi hết chỗ hoặc khi đợi lần đổi mã trước quá 8 giây. Trường hợp chờ có `Retry-After: 1`. `USER_CAPACITY_EXCEEDED` báo đã đủ 1.000 user. Giới hạn cũng là 1.000 attempt còn hạn, 1.000 phiên hoặc lượt cấp phiên đang xử lý, và tối đa 20 lần đổi mã đồng thời.
+
+## Cấu trúc source
+
+| Đường dẫn | Trách nhiệm |
+|---|---|
+| `index.ts` | Đọc cấu hình, nối các thành phần và đóng HTTP server cùng pool khi dừng. |
+| `src/auth/` | Xử lý attempt, đồng bộ user, phiên và mã hóa kết quả thử lại. |
+| `src/http/` | Routes, kiểm tra request và lỗi HTTP của C. |
+| `src/integrations/` | Đổi mã và đọc hồ sơ từ Rita. |
+| `src/database/` | Pool, transaction, migration và lưu trữ auth trên PostgreSQL. |
 
 ## Đọc log khi kiểm tra đăng nhập
 
@@ -77,6 +97,10 @@ npm run build
 ```
 
 Ngày 2026-11-20, typecheck, build và **10/10 test** đã qua ở C. Bộ test dùng hồ sơ hư cấu và gồm ca chạy HTTP qua Rita giả lập để kiểm tra đổi mã một lần, truy cập `/me`, refresh và logout.
+
+Đặt `C_TEST_DATABASE_URL` trong tiến trình test để chạy suite PostgreSQL. Dùng database tạm với quyền tạo schema. Suite tự tạo và dọn schema riêng, dùng hồ sơ hư cấu và Rita giả lập. Suite được đánh dấu skip khi biến này vắng mặt.
+
+Ngày 2026-11-25, typecheck, build và **31 test** đã qua, gồm **6 test** với PostgreSQL 17.11 cô lập. Kiểm tra thêm bản build qua hai lần restart tiến trình, xác nhận attempt, kết quả thử lại, `/me` và refresh tiếp tục hoạt động với Rita giả lập. Kiểm thử chuyển app trên thiết bị vẫn chờ nghiệm thu.
 
 Phiên trong C hết hạn theo chính sách riêng. Nếu tài khoản Rita bị vô hiệu hóa, lần đăng nhập Rita kế tiếp sẽ không được cấp phiên mới. Phiên C đang hoạt động có thể tiếp tục đến khi logout hoặc hết hạn.
 

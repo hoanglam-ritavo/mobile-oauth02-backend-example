@@ -22,6 +22,7 @@ export type LogEvent =
   | { event: "startup.listening"; host: string; port: number; ritaOrigin: string; callbackKind: CallbackKind }
   | { event: "startup.callback_warning"; callbackKind: "rita_authorize_entry" | "expo_go_authorize_entry" }
   | { event: "startup.failed"; code: string; setting?: string; host?: string; port?: number }
+  | { event: "database.failed"; operation: "idle_connection" | "prune" | "close" }
   | {
       event: "http.request";
       requestId: string;

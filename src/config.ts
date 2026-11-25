@@ -22,6 +22,26 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
+export function readDatabaseUrl(env: NodeJS.ProcessEnv): string {
+  const value = required(env, "DATABASE_URL");
+  const url = URL.parse(value);
+  if (!url || !["postgresql:", "postgres:"].includes(url.protocol) ||
+      !url.hostname || !url.username || url.pathname.length <= 1 ||
+      /[\x00-\x20\x7f\\#]/.test(value)) {
+    throw new ConfigError("DATABASE_URL", "Configure a PostgreSQL URL with a database and user");
+  }
+  return value;
+}
+
+export function readReplayKey(env: NodeJS.ProcessEnv): Buffer {
+  const value = required(env, "OAUTH_REPLAY_KEY");
+  const key = Buffer.from(value, "base64url");
+  if (key.length !== 32 || key.toString("base64url") !== value) {
+    throw new ConfigError("OAUTH_REPLAY_KEY", "Configure a 32-byte base64url key");
+  }
+  return key;
+}
+
 function parseUrl(value: string, key: string): URL {
   let url: URL;
   try {
